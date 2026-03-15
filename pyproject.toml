@@ -1,0 +1,9 @@
+[project]
+name = "nm-ai-2026"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "websockets>=16.0",
+]
