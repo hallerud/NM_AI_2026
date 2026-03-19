@@ -1,0 +1,26 @@
+# Data
+data/
+yolo_dataset/
+yolo_dataset_full/
+
+# Model weights & runs
+runs/
+*.pt
+*.onnx
+
+# Submissions
+trained_submission/
+submission_*/
+
+# Environment
+venv/
+pylibs/
+__pycache__/
+*.pyc
+
+# Logs
+logs/
+
+# Temp
+/tmp/
+*.sif
