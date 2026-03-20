@@ -1,10 +1,9 @@
 # NorgesGruppen Object Detection Competition - Task 1
 
 ## Current Status
-- **Best Score: mAP 0.9137** (3-model ensemble, rank TBD) — previous best 0.7773
-- **Pending: TTA ensemble submission** (expected ~0.917-0.920)
+- **Best Score: mAP 0.9154** (3-model ensemble + TTA hflip) — up from 0.9137
 - **Deadline: ~2026-03-21**
-- **Submissions: 4 remaining today (2026-03-20)**
+- **Submissions: 3 remaining today (2026-03-20)**
 - **GPU hours remaining: ~860 of 1000** (expires 2026-04-01)
 
 ## Submissions History
@@ -14,8 +13,8 @@
 | 1 | yolov8l_v13 | ONNX FP16, 1280 | 0.15/0.5 | 0.7615 | Baseline |
 | 2 | v32_x_moreaug_16002 | ONNX FP16, 1600 | 0.15/0.5 | 0.7716 | YOLOv8x, more aug |
 | 3 | v41_x_long200 | ONNX FP32, 1600 | 0.001/0.6 | 0.7773 | 200ep, FP32, low conf |
-| **4** | **Ensemble: v63+v41+v64** | **3x ONNX FP16** | **0.001/0.6 WBF** | **0.9137** | **3-model WBF ensemble** |
-| 5 | Ensemble + TTA hflip | 3x ONNX FP16 | 0.001/0.6 WBF | *pending* | TTA: orig+hflip per model, 6 pred sets |
+| 4 | Ensemble: v63+v41+v64 | 3x ONNX FP16 | 0.001/0.6 WBF | 0.9137 | 3-model WBF ensemble |
+| **5** | **Ensemble + TTA hflip** | **3x ONNX FP16** | **0.001/0.6 WBF** | **0.9154** | **+TTA: orig+hflip per model, 6 pred sets** |
 
 ## What Worked (Key Breakthroughs)
 
@@ -37,6 +36,10 @@ Dense shelf scenes have many overlapping products. Higher IoU threshold keeps mo
 ### 4. FP16 for all 3 models
 Fits 3 models under 420MB limit (131+131+84 = 347MB). FP16 quantization loss is compensated by ensemble diversity.
 
+### 5. Test-Time Augmentation — horizontal flip (+0.0017 mAP)
+Each model runs on original + horizontally flipped image, doubling prediction sets (3→6) for WBF.
+Small but consistent improvement: 0.9137 → 0.9154 on contest.
+
 ## What Didn't Work
 - **Product reference images as training data**: No improvement (v50 = v53)
 - **RT-DETR**: Classification head doesn't converge with 356 classes on 248 images
@@ -55,8 +58,9 @@ Tested iou_thr={0.5, 0.55, 0.6, 0.65} — all within 0.0002 of each other. Defau
 
 ## Roadmap to 0.95+ mAP
 
-Current score breakdown (estimated): ~0.95 det mAP × 0.70 + ~0.88 cls mAP × 0.30 ≈ 0.914.
+Current score breakdown (estimated): ~0.95 det mAP × 0.70 + ~0.88 cls mAP × 0.30 ≈ 0.915.
 Detection is already strong. The biggest gains are in **classification accuracy**.
+To reach 0.95: need e.g. 0.96 det × 0.70 + 0.93 cls × 0.30 = 0.672 + 0.279 = 0.951.
 
 ### 1. Classification re-ranking with embeddings (HIGH — targets 30% of score)
 The single most promising path to 0.95+. The idea:
