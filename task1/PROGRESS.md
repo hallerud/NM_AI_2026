@@ -92,6 +92,30 @@ Current: 2× YOLOv8x + 1× YOLOv8l. A small YOLOv8s (~20MB ONNX) could add diver
 73MB headroom remains in the 420MB weight budget.
 Different augmentation or image size would maximize ensemble diversity.
 
+## Available Data
+
+### 1. Shelf images + annotations (`data/train/`)
+- **248 images** annotated in `annotations.json` (COCO format), but only **210 on disk** — the other 38 are likely the hidden test set
+- **22,731 annotations** across **356 product categories**
+- Images vary widely: 481×399 to 5712×4624 pixels
+- Dense scenes: avg **92 annotations/image**, max 235
+- **Long-tail distribution**: median 28 annotations per category, but 110 categories have <10 examples and 74 have <5
+- Annotation format: `[x, y, width, height]` (COCO bbox), with `category_id`, `image_id`, `area`, `iscrowd`
+- Category names are product descriptions, e.g. "FRØKRISP KNEKKEBRØD ØKOLOGISK 170G BERIT"
+
+### 2. Product reference images (`data/NM_NGD_product_images/`)
+- **345 product folders** (named by EAN/barcode), each containing up to 7 views: front, back, left, right, top, bottom, main
+- Covers 345 of 356 categories — **11 categories have no product images**
+- **Not currently used** in training or inference
+- No explicit mapping file from folder name (EAN) to category_id — mapping must be inferred or built
+- These are clean studio shots of individual products, very different from the shelf images
+- **Potential uses**: classification re-ranking (embed crops → match to reference), few-shot classification, data augmentation
+
+### 3. What's NOT available
+- No validation set — must use contest submissions or cross-validation on training data
+- No test images — test set is hidden, evaluation is server-side
+- Category metadata is minimal (name + supercategory "product") — no EAN-to-category mapping provided
+
 ## Scoring Formula
 - **70% detection mAP** — did you find the products? (IoU >= 0.5, category ignored)
 - **30% classification mAP** — correct product ID? (IoU >= 0.5 AND correct category_id)
