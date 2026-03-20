@@ -73,22 +73,46 @@ def run_model(session, img_np, imgsz, img_w, img_h, conf_thresh=0.001):
     return decode_yolo(outputs, scale, dw, dh, img_w, img_h, conf_thresh)
 
 
+def run_model_tta(session, img_np, imgsz, img_w, img_h, conf_thresh=0.001):
+    """Run one ONNX model with TTA (original + horizontal flip).
+    Returns list of (boxes_norm, scores, class_ids) — one per augmentation.
+    """
+    results = []
+
+    # Original
+    boxes, scores, cids = run_model(session, img_np, imgsz, img_w, img_h, conf_thresh)
+    results.append((boxes, scores, cids))
+
+    # Horizontal flip
+    img_flip = img_np[:, ::-1, :].copy()
+    boxes_f, scores_f, cids_f = run_model(session, img_flip, imgsz, img_w, img_h, conf_thresh)
+    if len(boxes_f) > 0:
+        # Flip boxes back: x1_new = 1 - x2_old, x2_new = 1 - x1_old
+        x1 = 1.0 - boxes_f[:, 2]
+        x2 = 1.0 - boxes_f[:, 0]
+        boxes_f[:, 0] = x1
+        boxes_f[:, 2] = x2
+    results.append((boxes_f, scores_f, cids_f))
+
+    return results
+
+
 def ensemble_predict(models, img_np, img_w, img_h, iou_thresh=0.6, skip_thresh=0.001):
-    """Run all models, merge with Weighted Boxes Fusion."""
+    """Run all models with TTA, merge with Weighted Boxes Fusion."""
     all_boxes, all_scores, all_labels = [], [], []
     weights = []
 
     for session, imgsz, weight in models:
-        boxes, scores, cids = run_model(session, img_np, imgsz, img_w, img_h, skip_thresh)
-        if len(boxes) > 0:
-            all_boxes.append(boxes.tolist())
-            all_scores.append(scores.tolist())
-            all_labels.append(cids.tolist())
-            weights.append(weight)
-        else:
-            all_boxes.append([])
-            all_scores.append([])
-            all_labels.append([])
+        tta_results = run_model_tta(session, img_np, imgsz, img_w, img_h, skip_thresh)
+        for boxes, scores, cids in tta_results:
+            if len(boxes) > 0:
+                all_boxes.append(boxes.tolist())
+                all_scores.append(scores.tolist())
+                all_labels.append(cids.tolist())
+            else:
+                all_boxes.append([])
+                all_scores.append([])
+                all_labels.append([])
             weights.append(weight)
 
     if all(len(b) == 0 for b in all_boxes):

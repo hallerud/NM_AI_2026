@@ -1,21 +1,22 @@
 #!/bin/bash
-#SBATCH --job-name=pkg_ensemble
+#SBATCH --job-name=bm_tta
 #SBATCH --account=nn11127k
 #SBATCH --partition=accel
 #SBATCH --nodes=1
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=00:30:00
-#SBATCH --output=logs/package_ensemble_%j.log
+#SBATCH --time=00:25:00
+#SBATCH --output=logs/bm_tta_%j.log
 
-# Usage: sbatch package_ensemble.slurm "v63_x_full v62_rtdetr_full"
+# Generic single-config benchmark job.
+# Usage: sbatch benchmark_parallel.slurm "--runs v63_x_full v41_x_long200 v64_l_full --ensemble --tta --wbf-iou 0.55"
 
 WORKDIR=/cluster/home/ksv023/NM_AI_2026/task1
 CONTAINER=/cluster/work/support/container/pytorch_nvidia_25.06_arm64.sif
 VENV=${WORKDIR}/venv
 
-ARGS=${1:?Usage: sbatch package_ensemble.slurm "--runs RUN1 RUN2 [--half 1 1] [--out DIR]"}
+ARGS=${1:?Usage: sbatch benchmark_parallel.slurm "BENCHMARK_ARGS"}
 
 mkdir -p ${WORKDIR}/logs
 
@@ -26,5 +27,5 @@ apptainer exec --nv \
     source ${VENV}/bin/activate
     export PYTHONPATH=${WORKDIR}/pylibs:\${PYTHONPATH}
     cd ${WORKDIR}
-    python3 package_ensemble.py ${ARGS}
+    python3 benchmark.py ${ARGS}
 "

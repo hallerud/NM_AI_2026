@@ -170,8 +170,50 @@ def benchmark_single(run_name, imgsz=None):
     return score
 
 
-def benchmark_ensemble(run_names, imgsz_list=None):
-    """Benchmark ensemble using WBF."""
+def run_ultralytics_tta(model, img_path, imgsz, conf_thresh=0.001):
+    """Run ultralytics model with TTA (original + horizontal flip).
+    Returns list of (norm_boxes_x1y1x2y2, scores, cids) for each augmentation.
+    """
+    img = np.array(Image.open(img_path).convert("RGB"))
+    img_h, img_w = img.shape[:2]
+    results_list = []
+
+    # Original
+    boxes, scores, cids = run_ultralytics(model, img_path, imgsz, conf_thresh)
+    if len(boxes) > 0:
+        norm = np.zeros((len(boxes), 4))
+        norm[:, 0] = np.clip(boxes[:, 0] / img_w, 0, 1)
+        norm[:, 1] = np.clip(boxes[:, 1] / img_h, 0, 1)
+        norm[:, 2] = np.clip((boxes[:, 0] + boxes[:, 2]) / img_w, 0, 1)
+        norm[:, 3] = np.clip((boxes[:, 1] + boxes[:, 3]) / img_h, 0, 1)
+        results_list.append((norm, scores, cids))
+    else:
+        results_list.append((np.zeros((0, 4)), np.array([]), np.array([])))
+
+    # Horizontal flip — save flipped image to temp file for ultralytics
+    import tempfile
+    img_flip = img[:, ::-1, :].copy()
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        Image.fromarray(img_flip).save(tmp.name)
+        tmp_path = tmp.name
+    boxes_f, scores_f, cids_f = run_ultralytics(model, tmp_path, imgsz, conf_thresh)
+    Path(tmp_path).unlink()
+    if len(boxes_f) > 0:
+        norm_f = np.zeros((len(boxes_f), 4))
+        # Flip boxes back: new_x1 = 1 - old_x2, new_x2 = 1 - old_x1
+        norm_f[:, 0] = np.clip(1.0 - (boxes_f[:, 0] + boxes_f[:, 2]) / img_w, 0, 1)
+        norm_f[:, 1] = np.clip(boxes_f[:, 1] / img_h, 0, 1)
+        norm_f[:, 2] = np.clip(1.0 - boxes_f[:, 0] / img_w, 0, 1)
+        norm_f[:, 3] = np.clip((boxes_f[:, 1] + boxes_f[:, 3]) / img_h, 0, 1)
+        results_list.append((norm_f, scores_f, cids_f))
+    else:
+        results_list.append((np.zeros((0, 4)), np.array([]), np.array([])))
+
+    return results_list
+
+
+def benchmark_ensemble(run_names, imgsz_list=None, use_tta=False, wbf_iou=0.6, wbf_weights=None):
+    """Benchmark ensemble using WBF, optionally with TTA."""
     from ultralytics import YOLO
     from ensemble_boxes import weighted_boxes_fusion
 
@@ -195,8 +237,10 @@ def benchmark_ensemble(run_names, imgsz_list=None):
         print(f"  Loading {run_name} (imgsz={imgsz})")
         models.append((YOLO(str(weights)), imgsz))
 
+    tta_label = " + TTA (hflip)" if use_tta else ""
     print(f"\n{'='*60}")
-    print(f"  Benchmarking ensemble: {run_names}")
+    print(f"  Benchmarking ensemble{tta_label}: {run_names}")
+    print(f"  WBF iou_thr={wbf_iou}, weights={wbf_weights or [1.0]*len(models)}")
     print(f"{'='*60}")
 
     image_files = sorted(IMAGES_DIR.glob("*.jpg"))
@@ -210,29 +254,44 @@ def benchmark_ensemble(run_names, imgsz_list=None):
         img_h, img_w = img.shape[:2]
 
         all_boxes, all_scores, all_labels = [], [], []
-        for model, imgsz in models:
-            boxes, scores, cids = run_ultralytics(model, img_path, imgsz)
-            if len(boxes) > 0:
-                # Normalize to [0,1] for WBF
-                norm_boxes = np.zeros((len(boxes), 4))
-                norm_boxes[:, 0] = np.clip(boxes[:, 0] / img_w, 0, 1)
-                norm_boxes[:, 1] = np.clip(boxes[:, 1] / img_h, 0, 1)
-                norm_boxes[:, 2] = np.clip((boxes[:, 0] + boxes[:, 2]) / img_w, 0, 1)
-                norm_boxes[:, 3] = np.clip((boxes[:, 1] + boxes[:, 3]) / img_h, 0, 1)
-                all_boxes.append(norm_boxes.tolist())
-                all_scores.append(scores.tolist())
-                all_labels.append(cids.tolist())
+        model_weights = []
+        for mi, (model, imgsz) in enumerate(models):
+            w = (wbf_weights[mi] if wbf_weights and mi < len(wbf_weights) else 1.0)
+            if use_tta:
+                tta_results = run_ultralytics_tta(model, img_path, imgsz)
+                for norm_boxes, scores, cids in tta_results:
+                    if len(norm_boxes) > 0:
+                        all_boxes.append(norm_boxes.tolist())
+                        all_scores.append(scores.tolist())
+                        all_labels.append(cids.tolist())
+                    else:
+                        all_boxes.append([])
+                        all_scores.append([])
+                        all_labels.append([])
+                    model_weights.append(w)
             else:
-                all_boxes.append([])
-                all_scores.append([])
-                all_labels.append([])
+                boxes, scores, cids = run_ultralytics(model, img_path, imgsz)
+                if len(boxes) > 0:
+                    norm_boxes = np.zeros((len(boxes), 4))
+                    norm_boxes[:, 0] = np.clip(boxes[:, 0] / img_w, 0, 1)
+                    norm_boxes[:, 1] = np.clip(boxes[:, 1] / img_h, 0, 1)
+                    norm_boxes[:, 2] = np.clip((boxes[:, 0] + boxes[:, 2]) / img_w, 0, 1)
+                    norm_boxes[:, 3] = np.clip((boxes[:, 1] + boxes[:, 3]) / img_h, 0, 1)
+                    all_boxes.append(norm_boxes.tolist())
+                    all_scores.append(scores.tolist())
+                    all_labels.append(cids.tolist())
+                else:
+                    all_boxes.append([])
+                    all_scores.append([])
+                    all_labels.append([])
+                model_weights.append(w)
 
         if all(len(b) == 0 for b in all_boxes):
             continue
 
         fused_boxes, fused_scores, fused_labels = weighted_boxes_fusion(
             all_boxes, all_scores, all_labels,
-            weights=[1.0] * len(models), iou_thr=0.6, skip_box_thr=0.001,
+            weights=model_weights, iou_thr=wbf_iou, skip_box_thr=0.001,
         )
 
         for box, score, label in zip(fused_boxes, fused_scores, fused_labels):
@@ -260,6 +319,9 @@ def main():
     parser.add_argument("--runs", nargs="+", required=True)
     parser.add_argument("--ensemble", action="store_true", help="Also benchmark as ensemble")
     parser.add_argument("--imgsz", nargs="+", type=int, default=None)
+    parser.add_argument("--tta", action="store_true", help="Enable TTA (horizontal flip)")
+    parser.add_argument("--wbf-iou", type=float, default=0.6, help="WBF IoU threshold")
+    parser.add_argument("--wbf-weights", nargs="+", type=float, default=None, help="Per-model WBF weights")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -273,7 +335,10 @@ def main():
         scores[run_name] = benchmark_single(run_name)
 
     if args.ensemble and len(args.runs) > 1:
-        scores["ENSEMBLE"] = benchmark_ensemble(args.runs, args.imgsz)
+        scores["ENSEMBLE"] = benchmark_ensemble(
+            args.runs, args.imgsz,
+            use_tta=args.tta, wbf_iou=args.wbf_iou, wbf_weights=args.wbf_weights,
+        )
 
     print(f"\n{'='*60}")
     print(f"  Summary")

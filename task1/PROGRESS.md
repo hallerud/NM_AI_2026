@@ -2,8 +2,9 @@
 
 ## Current Status
 - **Best Score: mAP 0.9137** (3-model ensemble, rank TBD) — previous best 0.7773
+- **Pending: TTA ensemble submission** (expected ~0.917-0.920)
 - **Deadline: ~2026-03-21**
-- **Submissions: 3 per day**
+- **Submissions: 4 remaining today (2026-03-20)**
 - **GPU hours remaining: ~860 of 1000** (expires 2026-04-01)
 
 ## Submissions History
@@ -14,6 +15,7 @@
 | 2 | v32_x_moreaug_16002 | ONNX FP16, 1600 | 0.15/0.5 | 0.7716 | YOLOv8x, more aug |
 | 3 | v41_x_long200 | ONNX FP32, 1600 | 0.001/0.6 | 0.7773 | 200ep, FP32, low conf |
 | **4** | **Ensemble: v63+v41+v64** | **3x ONNX FP16** | **0.001/0.6 WBF** | **0.9137** | **3-model WBF ensemble** |
+| 5 | Ensemble + TTA hflip | 3x ONNX FP16 | 0.001/0.6 WBF | *pending* | TTA: orig+hflip per model, 6 pred sets |
 
 ## What Worked (Key Breakthroughs)
 
@@ -43,32 +45,48 @@ Fits 3 models under 420MB limit (131+131+84 = 347MB). FP16 quantization loss is 
 
 ## What To Try Next (Priority Order)
 
-### 1. Test-Time Augmentation (HIGH — likely +1-3%)
-Run each model at multiple scales (e.g. original + flipped) and merge all predictions with WBF.
-Current: 3 models x 1 scale = 3 inference passes.
-With TTA: 3 models x 2 scales x 2 flips = 12 passes. Must stay under 300s timeout.
-Easy to implement — just add flip/scale loops in ensemble_run.py.
+### DONE: Test-Time Augmentation (hflip)
+Implemented and benchmarked. Horizontal flip TTA adds +0.0036 local score (0.7049 → 0.7086).
+Now baked into ensemble_run.py — each model runs orig + hflip = 6 prediction sets for WBF.
+WBF IoU sweep (0.5–0.65) showed minimal difference; iou=0.6 remains optimal.
 
-### 2. Tune WBF parameters (MEDIUM — likely +0.5-1%)
-Current: iou_thr=0.6, skip_box_thr=0.001, weights=[1,1,1].
-Try: different iou thresholds (0.5, 0.55, 0.65), different model weights, skip thresholds.
-Use benchmark.py to test locally before submitting.
+### DONE: WBF parameter sweep
+Tested iou_thr={0.5, 0.55, 0.6, 0.65} — all within 0.0002 of each other. Default 0.6 is fine.
 
-### 3. Add a third architecture (MEDIUM — if it fits)
-Current ensemble is 2x YOLOv8x + 1x YOLOv8l — all YOLO. A different architecture would add more diversity.
-Options: Faster R-CNN (torchvision), FCOS, or a custom model with timm backbone.
-Challenge: must fit within 420MB total and 300s timeout.
+## Roadmap to 0.95+ mAP
 
-### 4. Classification re-ranking (MEDIUM — targets 30% of score)
-Detect with ensemble, crop each detection, compare crops to product reference images using embedding similarity (timm backbone). Could fix misclassifications.
-Product images: 326 products with front/back/left/right views in data/NM_NGD_product_images/.
+Current score breakdown (estimated): ~0.95 det mAP × 0.70 + ~0.88 cls mAP × 0.30 ≈ 0.914.
+Detection is already strong. The biggest gains are in **classification accuracy**.
 
-### 5. Larger image size for one model (LOW)
-Train one model at imgsz=1920 or 2048 for better small object detection.
-Risk: ONNX model gets huge, inference slow.
+### 1. Classification re-ranking with embeddings (HIGH — targets 30% of score)
+The single most promising path to 0.95+. The idea:
+1. Use current ensemble for detection (already strong)
+2. Crop each detected bounding box from the image
+3. Extract embeddings using a pretrained model (timm has EfficientNet/ConvNeXt, pre-installed in sandbox)
+4. Compare each crop embedding to pre-computed embeddings of the 326 product reference images
+5. Re-assign category_id based on nearest-neighbor similarity
 
-### 6. More training epochs / better schedule (LOW)
-Most models plateau by epoch 150-200. Diminishing returns.
+**Why this could work big:**
+- 30% of the score is classification. If det mAP is ~0.95 but cls mAP is ~0.88, fixing misclassifications could push total to 0.95+
+- Product reference images exist: 326 products × 4 views (front/back/left/right) in `data/NM_NGD_product_images/`
+- timm 0.9.12 is pre-installed in the sandbox — no extra weight files needed for embeddings
+- Can be done in run.py post-processing — no retraining required
+
+**Implementation plan:**
+- Pre-compute reference embeddings offline, save as .npy (~1MB)
+- In run.py: crop detections → embed → cosine similarity → re-rank class IDs
+- Ship: 3 ONNX models + 1 .npy file (well under 420MB)
+- Must fit within 300s timeout
+
+### 2. Multi-scale TTA (MEDIUM — +0.5-1%)
+Add a second scale (e.g. 0.8x) in addition to hflip.
+3 models × 2 scales × 2 flips = 12 prediction sets. More diversity for WBF.
+Risk: must stay under 300s sandbox timeout.
+
+### 3. Train a 4th complementary model (MEDIUM)
+Current: 2× YOLOv8x + 1× YOLOv8l. A small YOLOv8s (~20MB ONNX) could add diversity.
+73MB headroom remains in the 420MB weight budget.
+Different augmentation or image size would maximize ensemble diversity.
 
 ## Scoring Formula
 - **70% detection mAP** — did you find the products? (IoU >= 0.5, category ignored)
@@ -80,6 +98,7 @@ Benchmark offset: local score + ~0.08 ≈ contest score (based on v41: 0.693 loc
 
 | Model | Det mAP | Cls mAP | Local Score |
 |---|---|---|---|
+| **ENSEMBLE + TTA hflip** | **0.6795** | **0.7766** | **0.7086** |
 | ENSEMBLE (3 models) | 0.6761 | 0.7720 | 0.7049 |
 | v41_x_long200 | 0.6649 | 0.7587 | 0.6930 |
 | v63_x_full | 0.6635 | 0.7588 | 0.6921 |
@@ -91,6 +110,8 @@ Benchmark offset: local score + ~0.08 ≈ contest score (based on v41: 0.693 loc
 3. **Inference settings matter** — conf=0.001, iou=0.6 much better than conf=0.15, iou=0.5
 4. **FP16 is fine when ensembling** — quantization loss per model is compensated by ensemble averaging
 5. **Detection is the bottleneck** — 70% of score, and our det mAP is lower than cls mAP
+6. **TTA hflip helps modestly** — +0.0036 local score, consistent across WBF IoU settings
+7. **WBF IoU threshold is robust** — 0.5–0.65 all perform within 0.0002
 
 ## Infrastructure
 
@@ -114,8 +135,11 @@ Benchmark offset: local score + ~0.08 ≈ contest score (based on v41: 0.693 loc
 # Benchmark models locally (contest-style scoring)
 sbatch benchmark.slurm "v63_x_full v64_l_full v41_x_long200"
 
+# Benchmark with TTA + custom WBF params
+sbatch benchmark_parallel.slurm "--runs v63_x_full v41_x_long200 v64_l_full --ensemble --tta --wbf-iou 0.6"
+
 # Package ensemble submission
-sbatch package_ensemble.slurm "v63_x_full v41_x_long200 v64_l_full"
+sbatch package_ensemble.slurm "--runs v63_x_full v41_x_long200 v64_l_full --half 1 1 1 --out submission_tta"
 
 # Package single model
 sbatch package.slurm RUN_NAME
