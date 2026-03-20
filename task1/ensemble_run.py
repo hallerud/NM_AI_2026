@@ -73,37 +73,56 @@ def run_model(session, img_np, imgsz, img_w, img_h, conf_thresh=0.001):
     return decode_yolo(outputs, scale, dw, dh, img_w, img_h, conf_thresh)
 
 
-def run_model_tta(session, img_np, imgsz, img_w, img_h, conf_thresh=0.001):
-    """Run one ONNX model with TTA (original + horizontal flip).
+def run_model_tta(session, img_np, imgsz, img_w, img_h, conf_thresh=0.001,
+                   scales=(1.0,)):
+    """Run one ONNX model with TTA (each scale × {original, hflip}).
+    For scales != 1.0, the image is resized before letterboxing to simulate
+    running at a different resolution, while keeping the ONNX input size fixed.
     Returns list of (boxes_norm, scores, class_ids) — one per augmentation.
     """
     results = []
 
-    # Original
-    boxes, scores, cids = run_model(session, img_np, imgsz, img_w, img_h, conf_thresh)
-    results.append((boxes, scores, cids))
+    for scale_factor in scales:
+        if scale_factor == 1.0:
+            img_scaled = img_np
+            sw, sh = img_w, img_h
+        else:
+            # Resize image to simulate smaller effective resolution
+            sh = int(img_h * scale_factor)
+            sw = int(img_w * scale_factor)
+            img_scaled = np.array(Image.fromarray(img_np).resize((sw, sh), Image.BILINEAR))
 
-    # Horizontal flip
-    img_flip = img_np[:, ::-1, :].copy()
-    boxes_f, scores_f, cids_f = run_model(session, img_flip, imgsz, img_w, img_h, conf_thresh)
-    if len(boxes_f) > 0:
-        # Flip boxes back: x1_new = 1 - x2_old, x2_new = 1 - x1_old
-        x1 = 1.0 - boxes_f[:, 2]
-        x2 = 1.0 - boxes_f[:, 0]
-        boxes_f[:, 0] = x1
-        boxes_f[:, 2] = x2
-    results.append((boxes_f, scores_f, cids_f))
+        # Original at this scale
+        boxes, scores, cids = run_model(session, img_scaled, imgsz, sw, sh, conf_thresh)
+        results.append((boxes, scores, cids))
+
+        # Horizontal flip at this scale
+        img_flip = img_scaled[:, ::-1, :].copy()
+        boxes_f, scores_f, cids_f = run_model(session, img_flip, imgsz, sw, sh, conf_thresh)
+        if len(boxes_f) > 0:
+            # Flip boxes back: x1_new = 1 - x2_old, x2_new = 1 - x1_old
+            x1 = 1.0 - boxes_f[:, 2]
+            x2 = 1.0 - boxes_f[:, 0]
+            boxes_f[:, 0] = x1
+            boxes_f[:, 2] = x2
+        results.append((boxes_f, scores_f, cids_f))
 
     return results
 
 
 def ensemble_predict(models, img_np, img_w, img_h, iou_thresh=0.6, skip_thresh=0.001):
-    """Run all models with TTA, merge with Weighted Boxes Fusion."""
+    """Run all models with TTA, merge with Weighted Boxes Fusion.
+    The smallest model (by imgsz) gets multi-scale TTA for extra diversity.
+    """
     all_boxes, all_scores, all_labels = [], [], []
     weights = []
 
+    # Find the smallest imgsz to give it multi-scale TTA
+    min_imgsz = min(imgsz for _, imgsz, _ in models)
+
     for session, imgsz, weight in models:
-        tta_results = run_model_tta(session, img_np, imgsz, img_w, img_h, skip_thresh)
+        scales = (1.0, 0.85) if imgsz == min_imgsz else (1.0,)
+        tta_results = run_model_tta(session, img_np, imgsz, img_w, img_h, skip_thresh, scales=scales)
         for boxes, scores, cids in tta_results:
             if len(boxes) > 0:
                 all_boxes.append(boxes.tolist())

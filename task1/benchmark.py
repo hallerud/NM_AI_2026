@@ -21,6 +21,7 @@ from pycocotools.cocoeval import COCOeval
 WORKDIR = Path("/cluster/home/ksv023/NM_AI_2026/task1")
 ANNOTATIONS = WORKDIR / "data" / "train" / "annotations.json"
 IMAGES_DIR = WORKDIR / "data" / "train" / "images"
+EMBED_DIR = WORKDIR / "embed_data"
 
 
 def letterbox(img_np, target_size):
@@ -170,50 +171,139 @@ def benchmark_single(run_name, imgsz=None):
     return score
 
 
-def run_ultralytics_tta(model, img_path, imgsz, conf_thresh=0.001):
-    """Run ultralytics model with TTA (original + horizontal flip).
+def run_ultralytics_tta(model, img_path, imgsz, conf_thresh=0.001, scales=(1.0, 0.85)):
+    """Run ultralytics model with multi-scale TTA (each scale × {original, hflip}).
     Returns list of (norm_boxes_x1y1x2y2, scores, cids) for each augmentation.
     """
+    import tempfile
     img = np.array(Image.open(img_path).convert("RGB"))
     img_h, img_w = img.shape[:2]
     results_list = []
 
-    # Original
-    boxes, scores, cids = run_ultralytics(model, img_path, imgsz, conf_thresh)
-    if len(boxes) > 0:
-        norm = np.zeros((len(boxes), 4))
-        norm[:, 0] = np.clip(boxes[:, 0] / img_w, 0, 1)
-        norm[:, 1] = np.clip(boxes[:, 1] / img_h, 0, 1)
-        norm[:, 2] = np.clip((boxes[:, 0] + boxes[:, 2]) / img_w, 0, 1)
-        norm[:, 3] = np.clip((boxes[:, 1] + boxes[:, 3]) / img_h, 0, 1)
-        results_list.append((norm, scores, cids))
-    else:
-        results_list.append((np.zeros((0, 4)), np.array([]), np.array([])))
+    for scale_factor in scales:
+        scaled_imgsz = int(imgsz * scale_factor)
 
-    # Horizontal flip — save flipped image to temp file for ultralytics
-    import tempfile
-    img_flip = img[:, ::-1, :].copy()
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-        Image.fromarray(img_flip).save(tmp.name)
-        tmp_path = tmp.name
-    boxes_f, scores_f, cids_f = run_ultralytics(model, tmp_path, imgsz, conf_thresh)
-    Path(tmp_path).unlink()
-    if len(boxes_f) > 0:
-        norm_f = np.zeros((len(boxes_f), 4))
-        # Flip boxes back: new_x1 = 1 - old_x2, new_x2 = 1 - old_x1
-        norm_f[:, 0] = np.clip(1.0 - (boxes_f[:, 0] + boxes_f[:, 2]) / img_w, 0, 1)
-        norm_f[:, 1] = np.clip(boxes_f[:, 1] / img_h, 0, 1)
-        norm_f[:, 2] = np.clip(1.0 - boxes_f[:, 0] / img_w, 0, 1)
-        norm_f[:, 3] = np.clip((boxes_f[:, 1] + boxes_f[:, 3]) / img_h, 0, 1)
-        results_list.append((norm_f, scores_f, cids_f))
-    else:
-        results_list.append((np.zeros((0, 4)), np.array([]), np.array([])))
+        # Original at this scale
+        boxes, scores, cids = run_ultralytics(model, img_path, scaled_imgsz, conf_thresh)
+        if len(boxes) > 0:
+            norm = np.zeros((len(boxes), 4))
+            norm[:, 0] = np.clip(boxes[:, 0] / img_w, 0, 1)
+            norm[:, 1] = np.clip(boxes[:, 1] / img_h, 0, 1)
+            norm[:, 2] = np.clip((boxes[:, 0] + boxes[:, 2]) / img_w, 0, 1)
+            norm[:, 3] = np.clip((boxes[:, 1] + boxes[:, 3]) / img_h, 0, 1)
+            results_list.append((norm, scores, cids))
+        else:
+            results_list.append((np.zeros((0, 4)), np.array([]), np.array([])))
+
+        # Horizontal flip at this scale
+        img_flip = img[:, ::-1, :].copy()
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            Image.fromarray(img_flip).save(tmp.name)
+            tmp_path = tmp.name
+        boxes_f, scores_f, cids_f = run_ultralytics(model, tmp_path, scaled_imgsz, conf_thresh)
+        Path(tmp_path).unlink()
+        if len(boxes_f) > 0:
+            norm_f = np.zeros((len(boxes_f), 4))
+            norm_f[:, 0] = np.clip(1.0 - (boxes_f[:, 0] + boxes_f[:, 2]) / img_w, 0, 1)
+            norm_f[:, 1] = np.clip(boxes_f[:, 1] / img_h, 0, 1)
+            norm_f[:, 2] = np.clip(1.0 - boxes_f[:, 0] / img_w, 0, 1)
+            norm_f[:, 3] = np.clip((boxes_f[:, 1] + boxes_f[:, 3]) / img_h, 0, 1)
+            results_list.append((norm_f, scores_f, cids_f))
+        else:
+            results_list.append((np.zeros((0, 4)), np.array([]), np.array([])))
 
     return results_list
 
 
-def benchmark_ensemble(run_names, imgsz_list=None, use_tta=False, wbf_iou=0.6, wbf_weights=None):
-    """Benchmark ensemble using WBF, optionally with TTA."""
+def load_rerank_model():
+    """Load EfficientNet-B0 embedding model + reference embeddings."""
+    import torch
+    import timm
+
+    weights_path = EMBED_DIR / "embed_weights.pth"
+    ref_emb_path = EMBED_DIR / "ref_embeddings.npy"
+    ref_lab_path = EMBED_DIR / "ref_labels.npy"
+
+    if not weights_path.exists():
+        raise FileNotFoundError(f"Embedding weights not found: {weights_path}")
+
+    model = timm.create_model("efficientnet_b0", pretrained=False, num_classes=0)
+    state_dict = torch.load(weights_path, map_location="cpu")
+    # Convert FP16 weights back to FP32
+    state_dict = {k: v.float() for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
+    model = model.cuda().eval()
+
+    ref_embeddings = np.load(ref_emb_path).astype(np.float32)  # [N_ref, 1280]
+    ref_labels = np.load(ref_lab_path)  # [N_ref]
+    ref_embeddings_t = torch.from_numpy(ref_embeddings).cuda()
+
+    print(f"  Re-rank model loaded: {len(ref_labels)} reference embeddings, "
+          f"{len(set(ref_labels.tolist()))} categories")
+    return model, ref_embeddings_t, ref_labels
+
+
+def rerank_classifications(img_np, boxes_xywh, labels, embed_model, ref_embeddings_t,
+                           ref_labels, sim_threshold=0.5):
+    """Re-rank class labels using embedding similarity to reference images.
+
+    boxes_xywh: [N, 4] as x1, y1, w, h in pixel coords
+    labels: [N] YOLO-predicted category IDs
+    Returns: new_labels [N], similarities [N]
+    """
+    import torch
+    from torchvision import transforms
+
+    if len(boxes_xywh) == 0:
+        return labels, np.array([])
+
+    img_h, img_w = img_np.shape[:2]
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    crops = []
+    for box in boxes_xywh:
+        x1, y1, w, h = box
+        x1, y1 = max(0, int(x1)), max(0, int(y1))
+        x2, y2 = min(img_w, int(x1 + w)), min(img_h, int(y1 + h))
+        if x2 <= x1 or y2 <= y1:
+            # Degenerate box — use blank image
+            crops.append(torch.zeros(3, 224, 224))
+            continue
+        crop = img_np[y1:y2, x1:x2]
+        crops.append(transform(Image.fromarray(crop)))
+
+    batch = torch.stack(crops).cuda()  # [N, 3, 224, 224]
+
+    # Forward pass in chunks of 64
+    all_emb = []
+    with torch.no_grad():
+        for i in range(0, len(batch), 64):
+            emb = embed_model(batch[i:i+64])
+            emb = torch.nn.functional.normalize(emb, dim=1)
+            all_emb.append(emb)
+    crop_emb = torch.cat(all_emb, dim=0)  # [N, 1280]
+
+    # Cosine similarity
+    similarity = crop_emb @ ref_embeddings_t.T  # [N, N_ref]
+    best_sim, best_idx = similarity.max(dim=1)
+    best_ref_label = ref_labels[best_idx.cpu().numpy()]
+    best_sim = best_sim.cpu().numpy()
+
+    new_labels = labels.copy()
+    for j in range(len(labels)):
+        if best_sim[j] > sim_threshold:
+            new_labels[j] = int(best_ref_label[j])
+
+    return new_labels, best_sim
+
+
+def benchmark_ensemble(run_names, imgsz_list=None, use_tta=False, wbf_iou=0.6, wbf_weights=None,
+                       rerank=False, sim_threshold=0.5):
+    """Benchmark ensemble using WBF, optionally with TTA and re-ranking."""
     from ultralytics import YOLO
     from ensemble_boxes import weighted_boxes_fusion
 
@@ -237,9 +327,15 @@ def benchmark_ensemble(run_names, imgsz_list=None, use_tta=False, wbf_iou=0.6, w
         print(f"  Loading {run_name} (imgsz={imgsz})")
         models.append((YOLO(str(weights)), imgsz))
 
+    # Load re-ranking model if requested
+    embed_model, ref_embeddings_t, ref_labels = None, None, None
+    if rerank:
+        embed_model, ref_embeddings_t, ref_labels = load_rerank_model()
+
     tta_label = " + TTA (hflip)" if use_tta else ""
+    rerank_label = f" + rerank(thr={sim_threshold})" if rerank else ""
     print(f"\n{'='*60}")
-    print(f"  Benchmarking ensemble{tta_label}: {run_names}")
+    print(f"  Benchmarking ensemble{tta_label}{rerank_label}: {run_names}")
     print(f"  WBF iou_thr={wbf_iou}, weights={wbf_weights or [1.0]*len(models)}")
     print(f"{'='*60}")
 
@@ -294,15 +390,27 @@ def benchmark_ensemble(run_names, imgsz_list=None, use_tta=False, wbf_iou=0.6, w
             weights=model_weights, iou_thr=wbf_iou, skip_box_thr=0.001,
         )
 
-        for box, score, label in zip(fused_boxes, fused_scores, fused_labels):
-            x1 = box[0] * img_w
-            y1 = box[1] * img_h
-            w = (box[2] - box[0]) * img_w
-            h = (box[3] - box[1]) * img_h
+        # Convert to pixel coords
+        boxes_pixel = np.zeros((len(fused_boxes), 4))
+        boxes_pixel[:, 0] = fused_boxes[:, 0] * img_w
+        boxes_pixel[:, 1] = fused_boxes[:, 1] * img_h
+        boxes_pixel[:, 2] = (fused_boxes[:, 2] - fused_boxes[:, 0]) * img_w
+        boxes_pixel[:, 3] = (fused_boxes[:, 3] - fused_boxes[:, 1]) * img_h
+        labels_arr = np.array(fused_labels, dtype=int)
+
+        # Re-rank classifications if enabled
+        if rerank and embed_model is not None:
+            labels_arr, _ = rerank_classifications(
+                img, boxes_pixel, labels_arr, embed_model,
+                ref_embeddings_t, ref_labels, sim_threshold,
+            )
+
+        for box, score, label in zip(boxes_pixel, fused_scores, labels_arr):
             predictions.append({
                 "image_id": image_id,
                 "category_id": int(label),
-                "bbox": [round(x1, 1), round(y1, 1), round(w, 1), round(h, 1)],
+                "bbox": [round(float(box[0]), 1), round(float(box[1]), 1),
+                         round(float(box[2]), 1), round(float(box[3]), 1)],
                 "score": round(float(score), 4),
             })
     elapsed = time.time() - t0
@@ -322,6 +430,9 @@ def main():
     parser.add_argument("--tta", action="store_true", help="Enable TTA (horizontal flip)")
     parser.add_argument("--wbf-iou", type=float, default=0.6, help="WBF IoU threshold")
     parser.add_argument("--wbf-weights", nargs="+", type=float, default=None, help="Per-model WBF weights")
+    parser.add_argument("--rerank", action="store_true", help="Enable embedding re-ranking")
+    parser.add_argument("--sim-threshold", type=float, default=0.5, help="Cosine similarity threshold for re-ranking")
+    parser.add_argument("--rerank-sweep", action="store_true", help="Sweep similarity thresholds")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -335,10 +446,22 @@ def main():
         scores[run_name] = benchmark_single(run_name)
 
     if args.ensemble and len(args.runs) > 1:
-        scores["ENSEMBLE"] = benchmark_ensemble(
-            args.runs, args.imgsz,
-            use_tta=args.tta, wbf_iou=args.wbf_iou, wbf_weights=args.wbf_weights,
-        )
+        if args.rerank_sweep:
+            # Sweep similarity thresholds
+            thresholds = [0.0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+            for thr in thresholds:
+                label = f"ENSEMBLE+rerank(thr={thr})"
+                scores[label] = benchmark_ensemble(
+                    args.runs, args.imgsz,
+                    use_tta=args.tta, wbf_iou=args.wbf_iou, wbf_weights=args.wbf_weights,
+                    rerank=True, sim_threshold=thr,
+                )
+        else:
+            scores["ENSEMBLE"] = benchmark_ensemble(
+                args.runs, args.imgsz,
+                use_tta=args.tta, wbf_iou=args.wbf_iou, wbf_weights=args.wbf_weights,
+                rerank=args.rerank, sim_threshold=args.sim_threshold,
+            )
 
     print(f"\n{'='*60}")
     print(f"  Summary")

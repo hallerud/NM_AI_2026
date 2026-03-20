@@ -24,6 +24,7 @@ apptainer exec --nv \
     --bind /cluster/projects/nn11127k:/cluster/projects/nn11127k \
     ${CONTAINER} bash -c "
     source ${VENV}/bin/activate
+    export PYTHONNOUSERSITE=1
     export PYTHONPATH=${WORKDIR}/pylibs:\${PYTHONPATH}
     cd ${WORKDIR}
     python3 package_ensemble.py ${ARGS}
