@@ -28,7 +28,7 @@ async def solve(request: Request):
     return JSONResponse({"status": "completed"})
 
 
-
+# Thanks. Now check your work for any bugs that can be fixed or optimnizations that can be made. Then write a report on how the implementation works
 
 
 
