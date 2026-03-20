@@ -1,24 +1,103 @@
 # NorgesGruppen Object Detection Competition - Task 1
 
 ## Current Status
-- **Baseline Score: mAP 0.7615** (first submission)
-- Phase 1 complete. Pipeline working end-to-end.
-- **Phase 2 sweep running** (6 experiments, submitted 2026-03-19)
-- **Deadline: ~2026-03-21** (~65 hours from Phase 2 start)
-- **Submissions: 3 per day** (1 used today, 2 remaining)
+- **Best Score: mAP 0.9137** (3-model ensemble, rank TBD) — previous best 0.7773
+- **Deadline: ~2026-03-21**
+- **Submissions: 3 per day**
+- **GPU hours remaining: ~860 of 1000** (expires 2026-04-01)
 
-## Competition Details
+## Submissions History
 
-### Scoring
+| # | Model | Export | Conf/IoU | Score | Notes |
+|---|---|---|---|---|---|
+| 1 | yolov8l_v13 | ONNX FP16, 1280 | 0.15/0.5 | 0.7615 | Baseline |
+| 2 | v32_x_moreaug_16002 | ONNX FP16, 1600 | 0.15/0.5 | 0.7716 | YOLOv8x, more aug |
+| 3 | v41_x_long200 | ONNX FP32, 1600 | 0.001/0.6 | 0.7773 | 200ep, FP32, low conf |
+| **4** | **Ensemble: v63+v41+v64** | **3x ONNX FP16** | **0.001/0.6 WBF** | **0.9137** | **3-model WBF ensemble** |
+
+## What Worked (Key Breakthroughs)
+
+### 1. Ensemble with Weighted Boxes Fusion (+0.14 mAP)
+The single biggest improvement. Three diverse models merged with WBF:
+- **v63_x_full**: YOLOv8x, imgsz=1600, 200ep, trained on yolo_full (248 images)
+- **v41_x_long200**: YOLOv8x, imgsz=1600, 200ep, older config (yolo_dataset_full)
+- **v64_l_full**: YOLOv8l, imgsz=1280, 200ep, trained on yolo_full (248 images)
+- Diversity from: different model sizes (x vs l), different image sizes (1600 vs 1280), different training data configs
+- `ensemble-boxes` is pre-installed in the sandbox
+- Submission allows up to 3 weight files, 420MB total
+
+### 2. Low confidence threshold (conf=0.001)
+COCO mAP evaluation rewards recall at all confidence levels. Low threshold + WBF lets the metric find the optimal operating point.
+
+### 3. Higher IoU for NMS (iou=0.6)
+Dense shelf scenes have many overlapping products. Higher IoU threshold keeps more valid detections.
+
+### 4. FP16 for all 3 models
+Fits 3 models under 420MB limit (131+131+84 = 347MB). FP16 quantization loss is compensated by ensemble diversity.
+
+## What Didn't Work
+- **Product reference images as training data**: No improvement (v50 = v53)
+- **RT-DETR**: Classification head doesn't converge with 356 classes on 248 images
+- **Multi-scale training**: No measurable improvement
+- **Heavy augmentation**: No measurable improvement over baseline aug
+
+## What To Try Next (Priority Order)
+
+### 1. Test-Time Augmentation (HIGH — likely +1-3%)
+Run each model at multiple scales (e.g. original + flipped) and merge all predictions with WBF.
+Current: 3 models x 1 scale = 3 inference passes.
+With TTA: 3 models x 2 scales x 2 flips = 12 passes. Must stay under 300s timeout.
+Easy to implement — just add flip/scale loops in ensemble_run.py.
+
+### 2. Tune WBF parameters (MEDIUM — likely +0.5-1%)
+Current: iou_thr=0.6, skip_box_thr=0.001, weights=[1,1,1].
+Try: different iou thresholds (0.5, 0.55, 0.65), different model weights, skip thresholds.
+Use benchmark.py to test locally before submitting.
+
+### 3. Add a third architecture (MEDIUM — if it fits)
+Current ensemble is 2x YOLOv8x + 1x YOLOv8l — all YOLO. A different architecture would add more diversity.
+Options: Faster R-CNN (torchvision), FCOS, or a custom model with timm backbone.
+Challenge: must fit within 420MB total and 300s timeout.
+
+### 4. Classification re-ranking (MEDIUM — targets 30% of score)
+Detect with ensemble, crop each detection, compare crops to product reference images using embedding similarity (timm backbone). Could fix misclassifications.
+Product images: 326 products with front/back/left/right views in data/NM_NGD_product_images/.
+
+### 5. Larger image size for one model (LOW)
+Train one model at imgsz=1920 or 2048 for better small object detection.
+Risk: ONNX model gets huge, inference slow.
+
+### 6. More training epochs / better schedule (LOW)
+Most models plateau by epoch 150-200. Diminishing returns.
+
+## Scoring Formula
 - **70% detection mAP** — did you find the products? (IoU >= 0.5, category ignored)
 - **30% classification mAP** — correct product ID? (IoU >= 0.5 AND correct category_id)
 
-### Dataset
-- 248 training images (shelf images with grocery products)
-- 356 product categories + 1 unknown_product (357 total)
-- 22,731 annotations (avg ~92 annotations per image — very dense scenes)
-- Images are 2000x1500 resolution
-- Also available: `NM_NGD_product_images/` — individual product reference images organized by barcode (left, right, front, back, top, main views)
+## Local Benchmark
+benchmark.py computes contest-style scores on training images (inflated but reliable for relative comparison).
+Benchmark offset: local score + ~0.08 ≈ contest score (based on v41: 0.693 local → 0.777 contest).
+
+| Model | Det mAP | Cls mAP | Local Score |
+|---|---|---|---|
+| ENSEMBLE (3 models) | 0.6761 | 0.7720 | 0.7049 |
+| v41_x_long200 | 0.6649 | 0.7587 | 0.6930 |
+| v63_x_full | 0.6635 | 0.7588 | 0.6921 |
+| v64_l_full | 0.6493 | 0.7274 | 0.6727 |
+
+## Key Lessons
+1. **Ensemble > single model** — 3 diverse models with WBF was worth +0.14 mAP
+2. **Validation on training data is useless** — must use held-out val or submit to contest
+3. **Inference settings matter** — conf=0.001, iou=0.6 much better than conf=0.15, iou=0.5
+4. **FP16 is fine when ensembling** — quantization loss per model is compensated by ensemble averaging
+5. **Detection is the bottleneck** — 70% of score, and our det mAP is lower than cls mAP
+
+## Infrastructure
+
+### Cluster (Olivia)
+- **GPU nodes:** ARM64 (Neoverse V2) + GH200 (96 GB HBM3)
+- **Container:** `/cluster/work/support/container/pytorch_nvidia_25.06_arm64.sif`
+- **Account:** nn11127k (~860 GPU hours remaining, expires 2026-04-01)
 
 ### Sandbox Constraints
 | Resource | Limit |
@@ -27,155 +106,29 @@
 | CPU | 4 vCPU |
 | Memory | 8 GB |
 | Timeout | 300 seconds |
-| Network | None (offline) |
-| Max zip size | 420 MB (uncompressed) |
-| Python | 3.11 |
-| PyTorch | 2.6.0+cu124 |
-| ultralytics | 8.1.0 |
-| onnxruntime-gpu | 1.20.0 |
-
-### Security Restrictions
-Blocked imports: `os`, `sys`, `subprocess`, `socket`, `shutil`, `pickle`, `yaml`, `requests`, `multiprocessing`, `threading`, etc.
-Use `pathlib` for file ops, `json` for config. ONNX format recommended for model weights.
-
-## Infrastructure
-
-### Cluster (Olivia)
-- **GPU nodes (accel partition):** ARM64 (Neoverse V2) + 4x GH200 (96 GB HBM3 each)
-- **Container:** `/cluster/work/support/container/pytorch_nvidia_25.06_arm64.sif`
-- **Account:** nn11127k (~986 billing hours, ~1000 GPU hours remaining, expires 2026-04-01)
-- **Working dir:** `/cluster/home/ksv023/NM_AI_2026/task1/`
-
-### Environment Setup (solved issues)
-- Container ships numpy 2.4.3 but torch compiled against numpy 1.x — **fix:** install numpy 1.26.4 to `pylibs/` and prepend to `PYTHONPATH`
-- Container has opencv-python (GUI) but no libxcb — **fix:** uninstall and install opencv-python-headless
-- Trained with ultralytics 8.4.24, sandbox has 8.1.0 — **fix:** export to ONNX (opset 17, FP16)
-- All slurm scripts use venv + PYTHONPATH override pattern
-
-### Key Paths
-```
-task1/
-├── data/train/annotations.json          # COCO format annotations
-├── data/train/images/                   # 248 training images (img_00001.jpg ... img_00248.jpg)
-├── data/NM_NGD_product_images/          # Product reference images by barcode
-├── yolo_dataset/                        # YOLO format (223 train, 25 val) — Phase 1
-├── yolo_dataset_full/                   # YOLO format (248 train, 10 val) — Phase 2
-├── runs/yolov8l_v13/                    # Phase 1 best model
-├── runs/v20_full_l_1280/                # Phase 2 sweep experiments
-├── runs/v21_full_l_1600/
-├── runs/v22_full_x_1280/
-├── runs/v23_full_x_1600/
-├── runs/v24_full_l_highbox/
-├── runs/v25_full_l_moreaug/
-├── trained_submission/submission.zip     # Current submission (77.5 MB)
-├── venv/                                # Python venv (system-site-packages)
-├── pylibs/                              # numpy 1.26.4 override
-├── sweep_train.py                       # Parameterized training script (CLI args)
-├── launch_sweep.sh                      # Launches all experiments as SLURM jobs
-├── package_model.py                     # Package any run: python package_model.py --run NAME
-├── package.slurm                        # SLURM wrapper: sbatch package.slurm RUN_NAME
-├── convert_fulldata.py                  # Full dataset converter (no val holdout)
-├── convert_dataset.py                   # Original 90/10 split converter
-├── train_model.py                       # Original single-model training script
-└── package_submission.py                # Original packaging script
-```
-
-## Phase 1 Results (COMPLETE)
-
-### Training Config
-- Model: YOLOv8l (43.9M params)
-- Image size: 1280px
-- Batch size: 9 (auto-selected for GH200 95GB)
-- Optimizer: AdamW (lr=0.001, lrf=0.01, warmup=5 epochs)
-- Augmentation: mosaic=1.0, mixup=0.1, copy_paste=0.2, degrees=5, scale=0.5, fliplr=0.5
-- Early stopped at epoch 79 (best at epoch 64, patience=15)
-- Training time: ~8 minutes on GH200
-
-### Validation Metrics (best epoch)
-| Metric | Value |
-|--------|-------|
-| Precision | 0.814 |
-| Recall | 0.800 |
-| mAP50 | 0.847 |
-| mAP50-95 | 0.592 |
-
-### Competition Score
-- **mAP: 0.7615**
-
----
-
-## Phase 2: Experiment Sweep (IN PROGRESS)
-
-### Sweep Design
-All experiments use:
-- **Full dataset** (248 train, 10 val for metrics only)
-- **150 epochs**, patience=30
-- **Inference: conf=0.01, NMS IoU=0.35** (was 0.15/0.5 — should boost recall on dense shelves)
-
-| Experiment | Model | ImgSz | Key Change | SLURM Job |
-|---|---|---|---|---|
-| `v20_full_l_1280` | YOLOv8l | 1280 | Control: full data + 150ep | 282911 |
-| `v21_full_l_1600` | YOLOv8l | 1600 | Higher resolution | 282912 |
-| `v22_full_x_1280` | YOLOv8x | 1280 | Bigger model (68M params) | 282913 |
-| `v23_full_x_1600` | YOLOv8x | 1600 | Bigger model + higher res | 282914 |
-| `v24_full_l_highbox` | YOLOv8l | 1280 | box=12, cls=0.3 (prioritize detection) | 282915 |
-| `v25_full_l_moreaug` | YOLOv8l | 1280 | copy_paste=0.4 | 282916 |
-
-### Sweep Results
-*(fill in after jobs complete)*
-
-| Experiment | Best Epoch | mAP50 | mAP50-95 | Competition Score | Notes |
-|---|---|---|---|---|---|
-| `v20_full_l_1280` | | | | | |
-| `v21_full_l_1600` | | | | | |
-| `v22_full_x_1280` | | | | | |
-| `v23_full_x_1600` | | | | | |
-| `v24_full_l_highbox` | | | | | |
-| `v25_full_l_moreaug` | | | | | |
-
-### Packaging a Model
-```bash
-# Package best experiment as submission
-sbatch package.slurm v22_full_x_1280
-
-# Download to local
-scp olivia:/cluster/home/ksv023/NM_AI_2026/task1/submission_v22_full_x_1280/submission.zip ~/Desktop/submission.zip
-```
-
----
-
-## Phase 3: Future Improvements (if time permits)
-
-### TTA (Test-Time Augmentation)
-- Multi-scale inference (1024, 1280, 1536) + horizontal flip
-- Merge with NMS or weighted boxes fusion
-- Must stay within 300s sandbox timeout
-
-### Classification Boost (30% of score)
-- Two-stage: detect then classify crops with embedding similarity
-- Use `NM_NGD_product_images/` as reference database
-- Class weighting / oversampling for rare categories
-
-### Other Ideas
-- RT-DETR (transformer detector, available in ultralytics)
-- Ensemble multiple models at inference
-- Synthetic data from product reference images
+| Max weight files | 3, 420 MB total |
+| Pre-installed | ensemble-boxes 1.0.9, ultralytics 8.1.0, timm 0.9.12, onnxruntime-gpu 1.20.0 |
 
 ## Useful Commands
 ```bash
-# Launch all sweep experiments
-bash launch_sweep.sh
+# Benchmark models locally (contest-style scoring)
+sbatch benchmark.slurm "v63_x_full v64_l_full v41_x_long200"
 
-# Monitor running jobs
+# Package ensemble submission
+sbatch package_ensemble.slurm "v63_x_full v41_x_long200 v64_l_full"
+
+# Package single model
+sbatch package.slurm RUN_NAME
+
+# Build datasets
+python3 make_dataset.py                  # shelf images only, proper split
+python3 make_dataset.py --product_images # + product reference images
+
+# Monitor
 squeue -u $USER
-tail -f logs/v2*.log
+python3 compare_runs.py
+cost -p nn11127k
 
-# Package a specific run
-sbatch package.slurm v22_full_x_1280
-
-# Download submission
-scp olivia:/cluster/home/ksv023/NM_AI_2026/task1/submission_v22_full_x_1280/submission.zip ~/Desktop/submission.zip
-
-# Check GPU hours
-cost
+# Download
+scp olivia:/cluster/home/ksv023/NM_AI_2026/task1/submission_ensemble/submission.zip ~/Desktop/
 ```

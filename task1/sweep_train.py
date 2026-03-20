@@ -20,6 +20,15 @@ def main():
     parser.add_argument("--cls", type=float, default=0.5)
     parser.add_argument("--copy_paste", type=float, default=0.2)
     parser.add_argument("--close_mosaic", type=int, default=10)
+    parser.add_argument("--mosaic", type=float, default=1.0)
+    parser.add_argument("--mixup", type=float, default=0.1)
+    parser.add_argument("--erasing", type=float, default=0.4)
+    parser.add_argument("--degrees", type=float, default=5.0)
+    parser.add_argument("--scale", type=float, default=0.5)
+    parser.add_argument("--lr0", type=float, default=0.001)
+    parser.add_argument("--lrf", type=float, default=0.01)
+    parser.add_argument("--warmup_epochs", type=float, default=5)
+    parser.add_argument("--multi_scale", type=float, default=0.0, help="Multi-scale factor (0.5 = +-50%)")
     parser.add_argument("--dataset", default="yolo_dataset_full", help="Dataset dir name")
     args = parser.parse_args()
 
@@ -39,46 +48,64 @@ def main():
     print(f"{'='*50}\n")
 
     model = YOLO(args.model)
+    is_rtdetr = "rtdetr" in args.model.lower()
 
-    model.train(
-        data=str(yaml_path),
-        epochs=args.epochs,
-        imgsz=args.imgsz,
-        batch=args.batch,
-        device=0,
-
-        # Augmentation
-        mosaic=1.0,
-        mixup=0.1,
-        copy_paste=args.copy_paste,
-        degrees=5.0,
-        scale=0.5,
-        flipud=0.0,
-        fliplr=0.5,
-
-        # Training
-        optimizer="AdamW",
-        lr0=0.001,
-        lrf=0.01,
-        warmup_epochs=5,
-        weight_decay=0.0005,
-
-        # Loss
-        box=args.box,
-        cls=args.cls,
-        dfl=1.5,
-
-        # Saving
-        save=True,
-        save_period=20,
-        plots=True,
-        patience=args.patience,
-        close_mosaic=args.close_mosaic,
-        workers=8,
-
-        project=str(workdir / "runs"),
-        name=args.name,
-    )
+    # RT-DETR uses its own loss/aug defaults; only pass what it supports
+    if is_rtdetr:
+        print("  Mode: RT-DETR (using RT-DETR defaults)")
+        model.train(
+            data=str(yaml_path),
+            epochs=args.epochs,
+            imgsz=args.imgsz,
+            batch=args.batch,
+            device=0,
+            optimizer="AdamW",
+            lr0=args.lr0,
+            lrf=args.lrf,
+            warmup_epochs=args.warmup_epochs,
+            weight_decay=0.0005,
+            save=True,
+            save_period=20,
+            plots=True,
+            patience=args.patience,
+            workers=8,
+            project=str(workdir / "runs"),
+            name=args.name,
+        )
+    else:
+        print("  Mode: YOLO")
+        model.train(
+            data=str(yaml_path),
+            epochs=args.epochs,
+            imgsz=args.imgsz,
+            batch=args.batch,
+            device=0,
+            mosaic=args.mosaic,
+            mixup=args.mixup,
+            copy_paste=args.copy_paste,
+            degrees=args.degrees,
+            scale=args.scale,
+            erasing=args.erasing,
+            flipud=0.0,
+            fliplr=0.5,
+            optimizer="AdamW",
+            lr0=args.lr0,
+            lrf=args.lrf,
+            warmup_epochs=args.warmup_epochs,
+            weight_decay=0.0005,
+            multi_scale=args.multi_scale,
+            box=args.box,
+            cls=args.cls,
+            dfl=1.5,
+            save=True,
+            save_period=20,
+            plots=True,
+            patience=args.patience,
+            close_mosaic=args.close_mosaic,
+            workers=8,
+            project=str(workdir / "runs"),
+            name=args.name,
+        )
 
     print(f"\n  Done: {args.name}")
 

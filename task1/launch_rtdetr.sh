@@ -1,6 +1,6 @@
 #!/bin/bash
-# Relaunch v30-v35 with 6h walltime (previous 3h was too short).
-# Run: bash launch_sweep2b.sh
+# Launch RT-DETR eval + full runs with correct defaults.
+# Run: bash launch_rtdetr.sh
 
 WORKDIR=/cluster/home/ksv023/NM_AI_2026/task1
 CONTAINER=/cluster/work/support/container/pytorch_nvidia_25.06_arm64.sif
@@ -8,23 +8,18 @@ VENV=${WORKDIR}/venv
 
 mkdir -p ${WORKDIR}/logs
 
-# NAME MODEL IMGSZ EPOCHS BOX CLS CP CLOSE_MOSAIC
 EXPERIMENTS=(
-    "v30_x_moreaug       yolov8x.pt  1280  150  7.5   0.5  0.4  10"
-    "v31_l_heavyaug      yolov8l.pt  1280  150  7.5   0.5  0.6  10"
-    "v32_x_moreaug_1600  yolov8x.pt  1600  150  7.5   0.5  0.4  10"
-    "v33_l_combo         yolov8l.pt  1280  150  12.0  0.3  0.4  10"
-    "v34_l_longmosaic    yolov8l.pt  1280  150  7.5   0.5  0.4  20"
-    "v35_x_combo         yolov8x.pt  1280  150  12.0  0.3  0.4  10"
+    "v60_rtdetr_eval    rtdetr-l.pt  1600  150  30  yolo_split  06:00:00"
+    "v62_rtdetr_full    rtdetr-l.pt  1600  150  30  yolo_full   06:00:00"
 )
 
-echo "Submitting ${#EXPERIMENTS[@]} experiments (6h walltime)..."
+echo "Relaunching RT-DETR with fixed config..."
 echo ""
 
 for exp in "${EXPERIMENTS[@]}"; do
-    read -r NAME MODEL IMGSZ EPOCHS BOX CLS CP CM <<< "$exp"
+    read -r NAME MODEL IMGSZ EPOCHS PATIENCE DATASET WALLTIME <<< "$exp"
 
-    JOB_SCRIPT=$(mktemp /tmp/sweep2b_XXXXXX.slurm)
+    JOB_SCRIPT=$(mktemp /tmp/rtdetr_XXXXXX.slurm)
     cat > ${JOB_SCRIPT} << SLURM
 #!/bin/bash
 #SBATCH --job-name=${NAME}
@@ -34,7 +29,7 @@ for exp in "${EXPERIMENTS[@]}"; do
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=10
 #SBATCH --mem=64G
-#SBATCH --time=06:00:00
+#SBATCH --time=${WALLTIME}
 #SBATCH --output=${WORKDIR}/logs/${NAME}_%j.log
 
 apptainer exec --nv \\
@@ -51,11 +46,11 @@ apptainer exec --nv \\
         --model ${MODEL} \\
         --imgsz ${IMGSZ} \\
         --epochs ${EPOCHS} \\
-        --box ${BOX} \\
-        --cls ${CLS} \\
-        --copy_paste ${CP} \\
-        --close_mosaic ${CM} \\
-        --dataset yolo_dataset_full
+        --patience ${PATIENCE} \\
+        --lr0 0.0001 \\
+        --lrf 0.01 \\
+        --warmup_epochs 3 \\
+        --dataset ${DATASET}
 "
 SLURM
 
@@ -66,4 +61,3 @@ done
 
 echo ""
 echo "Monitor: squeue -u \$USER"
-echo "Logs:    tail -f ${WORKDIR}/logs/v3*"

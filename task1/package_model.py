@@ -58,7 +58,7 @@ def nms(boxes, scores, iou_thresh=0.35):
     return keep
 
 
-def postprocess(outputs, conf_thresh=0.01, iou_thresh=0.35, r=1.0, dw=0, dh=0):
+def postprocess(outputs, conf_thresh=0.001, iou_thresh=0.6, r=1.0, dw=0, dh=0):
     preds = outputs[0][0].T  # (num_preds, 4+nc)
     boxes_raw, scores_all = preds[:, :4], preds[:, 4:]
     max_scores = scores_all.max(axis=1)
@@ -178,7 +178,7 @@ def main():
 
     from ultralytics import YOLO
     model = YOLO(str(weights))
-    model.export(format="onnx", imgsz=imgsz, half=True, opset=17, simplify=True)
+    model.export(format="onnx", imgsz=imgsz, half=False, opset=17, simplify=True)
 
     onnx_path = weights.with_suffix(".onnx")
     shutil.copy2(onnx_path, staging / "best.onnx")

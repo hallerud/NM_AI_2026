@@ -17,21 +17,25 @@ OUTPUT_DIR = WORKDIR / "trained_submission"
 # ================================================================
 
 
-def find_best_weights():
-    """Find the most recent best.pt from training runs."""
+def find_best_weights(run_name=None):
+    """Find best.pt from a specific run, or most recent if not specified."""
     runs_dir = WORKDIR / "runs"
     if not runs_dir.exists():
         raise FileNotFoundError(f"No runs directory at {runs_dir}. Train first!")
 
-    # Find all best.pt files, pick most recent
-    bests = sorted(runs_dir.rglob("best.pt"), key=lambda p: p.stat().st_mtime)
-    if not bests:
-        raise FileNotFoundError("No best.pt found in runs/. Training may not be done yet.")
+    if run_name:
+        best = runs_dir / run_name / "weights" / "best.pt"
+        if not best.exists():
+            raise FileNotFoundError(f"No best.pt at {best}")
+    else:
+        bests = sorted(runs_dir.rglob("best.pt"), key=lambda p: p.stat().st_mtime)
+        if not bests:
+            raise FileNotFoundError("No best.pt found in runs/. Training may not be done yet.")
+        best = bests[-1]
 
-    latest = bests[-1]
-    print(f"  Found: {latest}")
-    print(f"  Size: {latest.stat().st_size / 1024 / 1024:.1f} MB")
-    return latest
+    print(f"  Found: {best}")
+    print(f"  Size: {best.stat().st_size / 1024 / 1024:.1f} MB")
+    return best
 
 
 def make_pt_run_py():
@@ -65,7 +69,7 @@ def main():
         results = model(
             str(img_path),
             device=device,
-            imgsz=1280,
+            imgsz=1600,
             conf=0.15,
             iou=0.5,
             max_det=300,
@@ -108,7 +112,7 @@ from PIL import Image
 import onnxruntime as ort
 
 
-def letterbox(img, new_shape=1280):
+def letterbox(img, new_shape=1600):
     h, w = img.shape[:2]
     r = min(new_shape / h, new_shape / w)
     new_h, new_w = int(h * r), int(w * r)
@@ -173,7 +177,7 @@ def main():
     for i, img_path in enumerate(image_files):
         image_id = int(img_path.stem.split("_")[-1])
         img = np.array(Image.open(img_path).convert("RGB"))
-        processed, r, dw, dh = letterbox(img, 1280)
+        processed, r, dw, dh = letterbox(img, 1600)
         blob = np.transpose(processed.astype(np.float32) / 255.0, (2, 0, 1))[np.newaxis, ...]
         outputs = session.run(None, {input_name: blob})
         boxes, scores, cids = postprocess(outputs, r=r, dw=dw, dh=dh)
@@ -202,9 +206,9 @@ def main():
     print("  Packaging Trained Submission")
     print("=" * 50)
 
-    # Find weights
+    # Find weights — target best run: v32_x_moreaug_16002 (mAP50=0.9934)
     print("\n1. Finding trained weights...")
-    weights = find_best_weights()
+    weights = find_best_weights(run_name="v32_x_moreaug_16002")
     pt_size = weights.stat().st_size / 1024 / 1024
 
     # Clean output
@@ -218,7 +222,7 @@ def main():
     print(f"\n2. Exporting to ONNX FP16 ({pt_size:.1f} MB .pt)")
     from ultralytics import YOLO
     model = YOLO(str(weights))
-    model.export(format="onnx", imgsz=1280, half=True, opset=17, simplify=True)
+    model.export(format="onnx", imgsz=1600, half=True, opset=17, simplify=True)
     onnx_path = weights.with_suffix(".onnx")
     shutil.copy2(onnx_path, staging / "best.onnx")
     onnx_size = (staging / "best.onnx").stat().st_size / 1024 / 1024
