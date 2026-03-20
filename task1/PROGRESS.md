@@ -134,6 +134,20 @@ Benchmark offset: local score + ~0.08 ≈ contest score (based on v41: 0.693 loc
 | Max weight files | 3, 420 MB total |
 | Pre-installed | ensemble-boxes 1.0.9, ultralytics 8.1.0, timm 0.9.12, onnxruntime-gpu 1.20.0 |
 
+## Key Files
+| File | Purpose |
+|------|---------|
+| `ensemble_run.py` | Submission run.py — ONNX inference + TTA + WBF. This is what runs in the sandbox |
+| `benchmark.py` | Local evaluation (contest-style scoring). Supports `--tta`, `--wbf-iou`, `--wbf-weights` |
+| `package_ensemble.py` | Exports .pt → ONNX and zips submission (run.py + models) |
+| `package_ensemble.slurm` | Slurm wrapper for packaging |
+| `benchmark_parallel.slurm` | Slurm wrapper for single benchmark config (for parallel sweeps) |
+| `make_dataset.py` | Builds YOLO-format datasets from COCO annotations |
+| `data/train/annotations.json` | COCO-format ground truth (210 shelf images, 356 categories) |
+| `data/train/images/` | Training shelf images |
+| `data/NM_NGD_product_images/` | Product reference images (326 products × 4 views) — unused so far, key for re-ranking |
+| `runs/` | Training run outputs (weights, args.yaml, etc.) |
+
 ## Useful Commands
 ```bash
 # Benchmark models locally (contest-style scoring)
