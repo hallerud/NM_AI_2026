@@ -143,6 +143,7 @@ GET calls are FREE. Strategy: plan using pre-fetched data → minimum writes →
 6. 403 on the very first call → token invalid, stop immediately.
 7. Unknown task type + first 2 GETs return 404/403/500 → stop, report what you tried.
 8. Say DONE with a summary when finished.
+9. NEVER PUT/update an existing entity (customer, supplier, employee, etc.) unless the task explicitly asks you to change that entity's data. Use it as-is from pre-fetched context.
 
 ## API
 - Single entity: response.data.value | Lists: response.data.values | POST returns: response.data.value.id
@@ -186,6 +187,7 @@ Check pre-fetched products — if name exists, use it.
 
 ### Invoice
 GET /invoice ALWAYS requires dateFrom AND dateTo — use 2020-01-01 to 2030-12-31 if unknown.
+GET /order ALWAYS requires orderDateFrom AND orderDateTo — use 2020-01-01 to 2030-12-31 if unknown.
 1. Find/create customer, find/create product
 2. POST /order — customer, orderDate, deliveryDate, isPrioritizeAmountsIncludingVat,
    orderLines:[{{product:{{id}}, count, unitPriceExcludingVatCurrency|unitPriceIncludingVatCurrency}}]
