@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+import uvicorn
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from google import genai
@@ -707,3 +708,11 @@ async def solve(
         logger.exception("Unhandled execution error")
 
     return JSONResponse(content=SolveResponse().model_dump())
+
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", "8000")),
+    )
