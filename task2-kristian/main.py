@@ -212,7 +212,7 @@ Update: GET /project/{{id}} first → PUT with ALL fields + version + changes.
 ### Activity + Timesheets
 Activities are GLOBAL. GET /activity?fields=id,name,isProjectActivity to list them.
 Activity id:0 ("Generell") works for most cases — reuse it to avoid extra writes.
-POST /activity — name, isProjectActivity:true
+POST /activity — name, isProjectActivity:true, activityType:"PROJECT_GENERAL_ACTIVITY" (REQUIRED — omitting causes 422)
 POST /timesheet/entry — employee:{{id}}, activity:{{id}}, project:{{id}}, date, hours (decimal)
 
 ### Department
@@ -236,16 +236,53 @@ Bank reconciliation: customer payments → PUT /invoice/:payment. Supplier witho
 Skattetrekk entries: credit 2600, debit 1920.
 Reverse a voucher: PUT /ledger/voucher/{{id}}/:reverse?date=YYYY-MM-DD — date is REQUIRED query param, NO body
 
+### Voucher Error Correction (feil i bilag / Fehlerkorrektur / corrección de errores)
+When the task says to FIX or CORRECT errors in vouchers/postings:
+1. GET /ledger/voucher?dateFrom=YYYY-01-01&dateTo=YYYY-12-31 → list all vouchers in the period
+2. For each erroneous voucher the task identifies:
+   a. GET /ledger/voucher/{{id}}?fields=* → inspect all postings (accounts, amounts)
+   b. Reverse it: PUT /ledger/voucher/{{id}}/:reverse?date=YYYY-MM-DD (use original date)
+   c. Repost correctly: POST /ledger/voucher with the CORRECTED postings
+3. If the task says "posting on wrong account" → reverse the whole voucher, repost with correct account.
+4. If the task says "wrong amount" → reverse, repost with correct amount.
+5. Postings MUST sum to zero in each new voucher.
+
+Example — voucher 456 has 10000 on account 7100 but should be on 6300:
+  Step 1: PUT /ledger/voucher/456/:reverse?date=2025-03-15
+  Step 2: POST /ledger/voucher {{"date":"2025-03-15","description":"Korreksjon bilag 456","postings":[
+    {{"row":1,"date":"2025-03-15","account":{{"id":<6300_id>}},"amountGross":10000,"amountGrossCurrency":10000}},
+    {{"row":2,"date":"2025-03-15","account":{{"id":<1920_id>}},"amountGross":-10000,"amountGrossCurrency":-10000}}
+  ]}}
+
+IMPORTANT: You MUST write (reverse + repost) — do not just GET and stop. The task expects corrected entries.
+
 ### Fixed Assets & Depreciation
-POST /asset:
-  name (required), dateOfAcquisition:"YYYY-MM-DD" (NOT acquisitionDate),
-  acquisitionCost:N, account:{{id:X}} (balance sheet, e.g. 1200),
-  depreciationAccount:{{id:X}} (expense account, e.g. 6010, NOT depreciationAccountNumber),
-  lifetime:N (months, NOT years), depreciationMethod:"STRAIGHT_LINE"|"TAX_RELATED"|"MANUAL"|"NO_DEPRECIATION",
-  description (optional), incomingBalance:N (optional)
-PUT /asset/{{id}} — GET first for version + all fields, then PUT with all fields + version + changes.
+⚠️ CRITICAL: GET /asset returns 403 in this sandbox (module not enabled). DO NOT attempt GET /asset.
+If the task gives depreciation amounts → post manual vouchers DIRECTLY. Do NOT call any /asset endpoint.
+
+**Year-end depreciation workflow (avskrivning / Abschreibung / amortissement):**
+The task prompt will list assets and their depreciation amounts. For EACH asset:
+1. Find account IDs in pre-fetched ledger accounts for: expense account (typically 6010 Avskrivninger) and accumulated depreciation account (typically 1209 Akkumulerte avskrivninger, or 1029 for intangibles)
+2. POST /ledger/voucher with ONE voucher per asset (or one combined if task says so):
+   - Debit (positive): expense account (6010) for the depreciation amount
+   - Credit (negative): accumulated depreciation account (1209) for the same amount
+   - description: "Avskrivning <asset name>"
+   - date: use the date from the task (typically year-end, e.g. 2025-12-31)
+
+Example — task says "Kontormøbler depreciation 25 000":
+  POST /ledger/voucher body:
+  {{"date":"2025-12-31","description":"Avskrivning Kontormøbler","postings":[
+    {{"row":1,"date":"2025-12-31","account":{{"id":<6010_id>}},"amountGross":25000,"amountGrossCurrency":25000}},
+    {{"row":2,"date":"2025-12-31","account":{{"id":<1209_id>}},"amountGross":-25000,"amountGrossCurrency":-25000}}
+  ]}}
+
+If the task lists MULTIPLE assets, post ONE voucher per asset unless it explicitly says to combine them.
+Look up account IDs from pre-fetched ledger_accounts — DO NOT call GET /ledger/account.
+
+POST /asset (only if GET /asset succeeds — usually 403):
+  name, dateOfAcquisition:"YYYY-MM-DD", acquisitionCost:N, account:{{id}}, depreciationAccount:{{id}},
+  lifetime:N (months), depreciationMethod:"STRAIGHT_LINE"|"TAX_RELATED"|"MANUAL"|"NO_DEPRECIATION"
 PUT /asset/{{id}}/:depreciate — body: {{date:"YYYY-MM-DD", amount:N}}
-If GET /asset → 403: fall back to manual vouchers (debit 6010, credit 1209).
 
 ### Salary / Payroll
 GET /salary/type?fields=id,number,name → find salary type IDs (already in pre-fetched context).
@@ -283,8 +320,10 @@ These endpoints do NOT exist in the Tripletex API. After 2 GET attempts returnin
 POST /travelExpense — employee:{{id}}, title, travelDetails:{{"isForeignTravel":false}}
 POST /travelExpense/perDiemCompensation — travelExpense:{{id}}, location:"Oslo"
   DO NOT send: countryCode, numberOfDays, rateType, rateCategory (don't exist)
+  Count and rate are set automatically — do NOT follow up with a PUT to update them.
 POST /travelExpense/cost — travelExpense:{{id}}, amountCurrencyIncVat, paymentType:{{id}}
-  DO NOT send: vatAmountCurrency, vatType, amountGross (wrong field names)
+  DO NOT send: title, description, category, vatType, vatAmountCurrency, amountGross (wrong field names)
+  DO NOT try GET /swagger.json — it does not exist. Use the field names documented here.
 
 ## VAT
 excl. VAT / uten mva / ohne MwSt → isPrioritizeAmountsIncludingVat:false, unitPriceExcludingVatCurrency
@@ -314,6 +353,8 @@ def detect_task_type(prompt: str) -> str:
         (["leverandørfaktura", "supplier invoice", "lieferantenrechnung", "factura de proveedor", "facture fournisseur"], "Supplier Invoice"),
         (["avskrivning", "depreciation", "abschreibung", "amortissement", "depreciación"],     "Depreciation"),
         (["bankavst", "bank reconciliation", "bankabstimmung", "conciliación bancaria"],       "Bank Reconciliation"),
+        (["kostsenter", "dimensjon", "dimension", "cost center", "kostenstelle", "centre de coûts"], "Custom Dimensions (UNSUPPORTED)"),
+        (["feil i bilag", "korriger bilag", "voucher error", "correct the voucher", "fehlerkorrektur", "corrección de errores", "feil postering"], "Voucher Error Correction"),
         (["faktura", "invoice", "rechnung", "factura", "facture"],                             "Invoice"),
         (["ansatt", "employee", "empleado", "mitarbeiter", "employé", "ansette"],              "Employee"),
         (["prosjekt", "project", "proyecto", "projet", "projekt"],                             "Project"),
@@ -380,8 +421,15 @@ def run_agent(prompt: str, files: list, base_url: str, token: str, ctx: dict, ri
 ## Session
 - Employee ID: {ctx.get('employee_id')} ({ctx.get('employee_name')})
 - Company: {ctx.get('company_id')} — {ctx.get('company_name')}
-- Bank account: {ctx.get('bank_account') or 'not set'}
+- Bank account: {ctx.get('bank_account') or 'NOT SET'}
 - Today: {today}
+{"" if ctx.get('bank_account') else """
+⚠️ WARNING: This company has NO bank account registered.
+PUT /order/:invoice WILL FAIL with "company has no bank account".
+If the task asks to create and SEND an invoice, stop after creating the order.
+Do NOT attempt PUT /order/:invoice — it will always fail in this sandbox.
+Report the bank account issue in your summary.
+"""}
 
 ### VAT Types
 {fmt_list(ctx.get('vat_types', []), lambda v: f"ID {v['id']}: #{v['number']} {v['name']} ({v['pct']}%)")}
