@@ -1,0 +1,64 @@
+steps:
+# --- Build and Deploy Task 2 Service ---
+- id: 'Build and Deploy Task 2'
+  name: 'gcr.io/cloud-builders/docker'
+  args:
+  - 'build'
+  - '-t'
+  - 'europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/task2-service:$COMMIT_SHA' # Use Artifact Registry
+  - './task2' # Specify the build context as the 'task2' folder
+  dir: '.' # Execute from the root of the repository
+
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  entrypoint: gcloud
+  args:
+  - 'run'
+  - 'deploy'
+  - 'task2-service' # Name of your Cloud Run service for task2
+  - '--image'
+  - 'europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/task2-service:$COMMIT_SHA'
+  - '--region'
+  - 'europe-west1'
+  - '--allow-unauthenticated'
+  - '--platform'
+  - 'managed'
+  - '--timeout'
+  - '300'
+  - '--memory'
+  - '1Gi'
+  - '--project'
+  - '$PROJECT_ID'
+
+# --- Build and Deploy Task 3 Service ---
+- id: 'Build and Deploy Task 3'
+  name: 'gcr.io/cloud-builders/docker'
+  args:
+  - 'build'
+  - '-t'
+  - 'europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/task3-service:$COMMIT_SHA' # Use Artifact Registry
+  - './task3' # Specify the build context as the 'task3' folder
+  dir: '.' # Execute from the root of the repository
+
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+  entrypoint: gcloud
+  args:
+  - 'run'
+  - 'deploy'
+  - 'task3-service' # Name of your Cloud Run service for task3
+  - '--image'
+  - 'europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/task3-service:$COMMIT_SHA'
+  - '--region'
+  - 'europe-west1'
+  - '--allow-unauthenticated'
+  - '--platform'
+  - 'managed'
+  - '--timeout'
+  - '300'
+  - '--memory'
+  - '1Gi'
+  - '--project'
+  - '$PROJECT_ID'
+
+images:
+- 'europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/task2-service:$COMMIT_SHA'
+- 'europe-west1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/task3-service:$COMMIT_SHA'
