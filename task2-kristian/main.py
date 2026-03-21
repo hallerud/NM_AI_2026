@@ -232,7 +232,7 @@ Supplier invoice example (net 39800, 25% VAT=9950, total 49750):
 
 Bank reconciliation: customer payments → PUT /invoice/:payment. Supplier without invoice → expense vs 1920.
 Skattetrekk entries: credit 2600, debit 1920.
-Reverse a voucher: PUT /ledger/voucher/{{id}}/:reverse — NO body
+Reverse a voucher: PUT /ledger/voucher/{{id}}/:reverse?date=YYYY-MM-DD — date is REQUIRED query param, NO body
 
 ### Fixed Assets & Depreciation
 POST /asset:
