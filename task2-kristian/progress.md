@@ -160,17 +160,24 @@ POST /activity: name, isProjectActivity:true
 ```
 PUT /invoice/{id}/:payment — body: {paymentDate, paymentTypeId (plain int!), paidAmount, paidAmountCurrency}
 GET /invoice — requires dateFrom and dateTo params (use 2020-01-01 to 2030-12-31 if unknown)
-PUT /order/{id}/:invoice — FAILS in sandbox ("company has no bank account", unfixable via API)
-  → stop after first failure, do NOT retry
+PUT /order/{id}/:invoice — may need ?invoiceDate=YYYY-MM-DD as query param (422 "invoiceDate: Kan ikke være null" seen without it)
+  → still FAILS in sandbox with "company has no bank account" — stop after first bank-account failure, do NOT retry
+```
+
+### Fixed Assets & Depreciation — BROKEN (field names unconfirmed)
+```
+GET /asset → returns 403 "You do not have permission to access this feature" in some accounts.
+  → The assets module may need to be enabled first (unknown how via API).
+POST /asset — CONFIRMED BROKEN: fields acquisitionDate and depreciationAccountNumber do NOT exist.
+  → System prompt previously documented wrong field names. Correct fields UNKNOWN.
+  → Workaround: if /asset returns 403 or POST fails, fall back to manual vouchers.
+PUT /asset/{id}/:depreciate — body: {date, amount} (unconfirmed if asset creation works)
 ```
 
 ### Other Confirmed Patterns
 ```
 POST /supplier — name, isSupplier:true, organizationNumber (STRING)
   ← bankAccountNumber NOT a valid field on supplier
-
-PUT /asset/{id}/:depreciate — body: {date, amount}
-  ← never post depreciation as manual voucher
 
 PUT /ledger/voucher/{id}/:reverse — reverses a payment voucher cleanly
 
@@ -184,6 +191,8 @@ Bank account numbers from PDFs: strip ALL dots/spaces → must be exactly 11 dig
 3. **"Endpoint unreachable"** — caused by running without `--workers 3`. Single worker = tasks queue and timeout.
 4. **Salary/payroll** — endpoints completely unknown. Agent guesses randomly and fails. Zero score until discovered.
 5. **Ledger error correction** — sometimes hits 403 (invalid/expired proxy token per-task). Nothing the agent can do.
+6. **Fixed assets module** — `GET /asset` returns 403 in some sandbox accounts (module not enabled). `POST /asset` field names documented in system prompt were WRONG (`acquisitionDate`, `depreciationAccountNumber` don't exist). Correct fields unknown — needs sandbox discovery.
+7. **Custom accounting dimensions** — agent burned 15 iterations (0/13, 0%) trying 9 different endpoints, all 404. No early-exit behaviour when task type is completely unknown.
 
 ## What To Focus On Next (priority order)
 
@@ -214,9 +223,11 @@ which fields to extract and how to handle missing data.
 ## Still Unknown / To Discover
 
 1. **Salary/payroll** — entire flow unknown. `/salary/transaction`, `/salary/payslip` return 500/404.
-2. **Custom accounting dimensions** — endpoint unknown. Task: create dimension "Region" with values.
+2. **Custom accounting dimensions** — endpoint unknown. Task: create dimension "Kostsenter" with values "Kundeservice" and "Økonomi", then post voucher linked to a dimension value. Agent tried: `/dimension`, `/accountingDimension`, `/ledger/dimension`, `/projectCategory`, `/customDimension`, `/ledger/costCenter`, `/costCenter` — all 404. Needs manual sandbox exploration.
 3. **Employee admin role** — "kontoadministrator" / administrator role assignment fields unknown.
-4. **~15 task types unseen** — keep submitting to discover them.
+4. **POST /asset correct field names** — `acquisitionDate` and `depreciationAccountNumber` are rejected. Need to GET /asset/{id}?fields=* on an existing asset in sandbox to find real field names.
+5. **PUT /order/:invoice invoiceDate param** — 422 "invoiceDate: Kan ikke være null" seen. May need `?invoiceDate=YYYY-MM-DD` as query param. Test in sandbox.
+6. **~15 task types unseen** — keep submitting to discover them.
 
 ## API Quick Reference
 - Auth: Basic Auth, username `0`, password = session_token

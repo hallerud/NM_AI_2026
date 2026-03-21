@@ -193,13 +193,13 @@ GET /invoice ALWAYS requires dateFrom AND dateTo — without them it returns 422
 POST /product — name; priceExcludingVatCurrency or priceIncludingVatCurrency; optional: number (product number as STRING), vatType:{{id}}
 CHECK pre-fetched products list before creating — if name already exists, use the existing product.
 
-### Customer Invoice — ACTION ENDPOINTS TAKE NO BODY
+### Customer Invoice
 IMPORTANT: If PUT /order/{{id}}/:invoice fails with "bank account" error — stop immediately, do not retry. Sandbox limitation.
 1. Find/create customer (check pre-fetched customers first)
 2. Find/create product (check pre-fetched products first)
 3. POST /order — customer, orderDate, deliveryDate, isPrioritizeAmountsIncludingVat,
    orderLines:[{{product:{{id}}, count, unitPriceExcludingVatCurrency|unitPriceIncludingVatCurrency}}]
-4. PUT /order/{{id}}/:invoice — NO body, NO params needed → returns invoice
+4. PUT /order/{{id}}/:invoice — NO body. Try first with no params. If 422 "invoiceDate: Kan ikke være null", retry with ?invoiceDate=TODAY as query param. If fails with "bank account" error → stop, do NOT retry.
 5. If "send": PUT /invoice/{{id}}/:send?sendType=EMAIL — NO body
 
 ### Payment
@@ -250,12 +250,14 @@ For supplier payments without existing supplier invoices, post expense vs 1920 (
 For tax/skattetrekk entries, use account 2600 only as the CREDIT side, debiting 1920.
 
 ### Fixed Assets & Depreciation
-GET /asset — list existing assets
-POST /asset — name, acquisitionCost, acquisitionDate, accountNumber (asset account e.g. 1200),
-  depreciationAccountNumber (accumulated depreciation e.g. 1209),
-  depreciationRate (annual % e.g. 12.5 for 8yr linear = 100/8)
+WARNING: GET /asset returns 403 "no permission" in some accounts (module may not be enabled).
+WARNING: POST /asset field names are UNCONFIRMED — acquisitionDate and depreciationAccountNumber
+  have been rejected. If /asset is accessible, do GET /asset/{{id}}?fields=* to discover real fields.
 PUT /asset/{{id}}/:depreciate — body: {{date:"YYYY-MM-DD", amount:DEPRECIATION_AMOUNT}}
-  This creates the voucher automatically. DO NOT post depreciation as manual vouchers.
+  Prefer this over manual vouchers IF the asset module is accessible.
+FALLBACK: If GET /asset → 403 or POST /asset → 422 field errors, post depreciation as manual vouchers:
+  debit expense account (e.g. 6010 Avskrivninger), credit accumulated depreciation account (e.g. 1209).
+  Example: 288400 / 3 years = 96133 NOK/year → row1: account 6010 +96133, row2: account 1209 -96133.
 
 ### Travel Expense
 POST /travelExpense — employee:{{id}}, title, travelDetails:{{"isForeignTravel":false}}
