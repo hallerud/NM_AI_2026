@@ -189,12 +189,14 @@ GET /invoice ALWAYS requires dateFrom AND dateTo — use 2020-01-01 to 2030-12-3
 1. Find/create customer, find/create product
 2. POST /order — customer, orderDate, deliveryDate, isPrioritizeAmountsIncludingVat,
    orderLines:[{{product:{{id}}, count, unitPriceExcludingVatCurrency|unitPriceIncludingVatCurrency}}]
-3. PUT /order/{{id}}/:invoice — NO body. If 422 "invoiceDate: Kan ikke være null" → add ?invoiceDate={TODAY}.
+3. PUT /order/{{id}}/:invoice — NO body. If 422 "invoiceDate: Kan ikke være null" → add ?invoiceDate={today}.
    If fails with "bank account" error → stop, do NOT retry (sandbox limitation).
 4. If "send": PUT /invoice/{{id}}/:send?sendType=EMAIL — NO body
 
 ### Payment
-PUT /invoice/{{id}}/:payment — body: {{paymentDate, paymentTypeId (plain int), paidAmount, paidAmountCurrency}}
+PUT /invoice/{{id}}/:payment — ALL fields as QUERY PARAMS (NOT body):
+  ?paymentDate=YYYY-MM-DD&paymentTypeId=N&paidAmount=N&paidAmountCurrency=N
+  Example: PUT /invoice/123/:payment?paymentDate=2026-03-21&paymentTypeId=28016109&paidAmount=33000&paidAmountCurrency=33000
 
 ### Credit Note
 PUT /invoice/{{id}}/:createCreditNote — NO body
@@ -569,12 +571,14 @@ Plan your steps, then execute efficiently."""
                     fatal_stop = True
                     break
 
-                # Fatal: token invalid on first call
+                # Fatal: token invalid on first call (only if it's an auth error, not a feature-access error)
                 if status == 403 and stats["iterations"] <= 1:
-                    stats["stop_reason"] = "fatal: 403 on first call"
-                    print(f"{tag}  🛑 Fatal: 403 on first call — token invalid, stopping.")
-                    fatal_stop = True
-                    break
+                    is_feature_403 = "permission to access this feature" in err_text or "feature" in err_text
+                    if not is_feature_403:
+                        stats["stop_reason"] = "fatal: 403 on first call"
+                        print(f"{tag}  🛑 Fatal: 403 on first call — token invalid, stopping.")
+                        fatal_stop = True
+                        break
 
             # Fatal: 3+ consecutive 404s on unknown endpoints (e.g. dimensions)
             if consecutive_404s >= 3:
