@@ -562,7 +562,8 @@ Plan your steps, then execute efficiently."""
                 d = result.get("data", {})
                 err_text = ""
                 if isinstance(d, dict):
-                    err_text = (str(d.get("message", "")) + " " + str(d.get("developerMessage", ""))).lower()
+                    validation_msgs = " ".join(str(v.get("message", "")) for v in (d.get("validationMessages") or []) if isinstance(v, dict))
+                    err_text = (str(d.get("message", "")) + " " + str(d.get("developerMessage", "")) + " " + validation_msgs).lower()
 
                 # Fatal: sandbox has no bank account — no point retrying
                 if "bank account" in err_text or "bankkonto" in err_text:
