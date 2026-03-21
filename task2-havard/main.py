@@ -27,9 +27,10 @@ TRIPLETEX_TIMEOUT_SECONDS = 30
 EXPECTED_ENDPOINT_API_KEY = os.getenv("TRIPLETEX_ENDPOINT_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
 SPEC_PATH = Path(__file__).with_name("tripletex.json")
-MAX_TOOL_CALLS = 40
+MAX_TOOL_CALLS = 12
 MAX_ATTACHMENT_BYTES_FOR_MODEL = 8 * 1024 * 1024
 MAX_TOOL_RESULT_CHARS = 8_000
+REQUEST_TIME_BUDGET_SECONDS = int(os.getenv("REQUEST_TIME_BUDGET_SECONDS", "240"))
 
 app = FastAPI(
     title="Tripletex AI Accounting Agent",
@@ -100,6 +101,20 @@ def compact_json(value: Any, *, max_chars: int = MAX_TOOL_RESULT_CHARS) -> str:
     if len(rendered) <= max_chars:
         return rendered
     return f"{rendered[:max_chars]}\n... [truncated]"
+
+
+def build_attachment_summary(attachments: list["PreparedAttachment"]) -> str:
+    if not attachments:
+        return "- No attachments provided"
+
+    lines: list[str] = []
+    for attachment in attachments:
+        line = f"- {attachment.filename} ({attachment.mime_type}, {attachment.size_bytes} bytes)"
+        if attachment.content_text_preview:
+            preview = normalize_text(attachment.content_text_preview)[:300]
+            line += f" preview={preview}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def prune_for_model(value: Any, *, depth: int = 0) -> Any:
@@ -534,32 +549,29 @@ Your goal is to maximize competition score while obeying all rules:
 - Minimize write calls aggressively. GET calls are free and should be used to verify state before risky writes.
 - Avoid duplicate writes, trial-and-error, and speculative POST/PUT/DELETE calls.
 - Use the API search and endpoint details tools before uncertain writes.
+- You are latency-sensitive. Finish quickly and avoid unnecessary tool calls.
 - Prompts may be in Norwegian, English, Spanish, Portuguese, Nynorsk, German, or French.
 - Attachments may contain critical facts. Use them when relevant.
 - Prefer exact field values from the prompt or files. Do not invent missing data.
 - When a task can be solved by updating or deleting an existing object, find the exact target with GET calls first.
 - After completing the task, verify the resulting state with GET calls when needed, then stop.
 
-Execution strategy:
-1. Infer the task type and likely endpoint family.
-2. Search the local API catalog for the right endpoints.
-3. Inspect endpoint details before the first write to understand required fields.
-4. Use GET calls to discover existing objects or prerequisite IDs.
-5. Perform the minimum necessary write calls.
-6. Verify with GET if the result could be ambiguous.
+Fast execution strategy:
+1. Infer the task type immediately from the prompt and attachment summary.
+2. Use the candidate endpoints already provided in the prompt before broader searching.
+3. Only call search_api or get_api_details if the route is unclear.
+4. Use GET calls to find prerequisite IDs and confirm targets.
+5. Perform the fewest writes possible, usually one per entity actually required.
+6. Verify only the critical final state, then stop.
 
-When you have completed the task, answer with a short plain-language summary.
+You must use tools, not free-form reasoning, for any Tripletex action.
+When done, answer with a very short plain-language summary.
 """.strip()
 
 
 def build_task_prompt(request: SolveRequest, attachments: list[PreparedAttachment], catalog: OpenAPICatalog) -> str:
-    attachment_lines = [
-        f"- {attachment.filename} ({attachment.mime_type}, {attachment.size_bytes} bytes)"
-        for attachment in attachments
-    ]
-    attachment_summary = "\n".join(attachment_lines) if attachment_lines else "- No attachments provided"
-
-    initial_candidates = catalog.search(request.prompt, limit=12)
+    attachment_summary = build_attachment_summary(attachments)
+    initial_candidates = catalog.search(request.prompt, limit=6)
 
     return f"""
 Task prompt:
@@ -575,6 +587,7 @@ Remember:
 - You are working against a fresh Tripletex competition account unless the prompt implies otherwise.
 - GET calls do not incur the efficiency penalty. Write calls do.
 - The local API catalog comes from the provided `tripletex.json`.
+- Prefer the listed candidate endpoints first.
 - Use the tool docstrings carefully and only write when you are confident.
 """.strip()
 
@@ -582,6 +595,13 @@ Remember:
 def build_contents(task_prompt: str, attachments: list[PreparedAttachment]) -> list[Any]:
     contents: list[Any] = [task_prompt]
     for attachment in attachments:
+        if attachment.mime_type == "application/pdf":
+            contents.append(
+                f"PDF attachment available: {attachment.filename} ({attachment.size_bytes} bytes). "
+                "Use the attachment only if the task clearly depends on it."
+            )
+            continue
+
         if attachment.size_bytes > MAX_ATTACHMENT_BYTES_FOR_MODEL:
             contents.append(
                 f"Attachment {attachment.filename} was omitted from the multimodal payload because it exceeds "
@@ -615,14 +635,12 @@ async def execute_accounting_task(
     attachments: list[PreparedAttachment],
 ) -> str:
     catalog = load_catalog()
-    connection_snapshot = await asyncio.to_thread(client.verify_connection)
     gemini_client = build_gemini_client()
 
     logger.info(
-        "Received task. prompt=%s attachments=%s employee_probe_count=%s",
+        "Received task. prompt=%s attachments=%s",
         request.prompt,
         len(attachments),
-        len(connection_snapshot.get("values", [])),
     )
 
     task_prompt = build_task_prompt(request, attachments, catalog)
@@ -660,9 +678,9 @@ async def execute_accounting_task(
     tool_names = ["search_api", "get_api_details", "tripletex_get", "tripletex_write"]
     config = types.GenerateContentConfig(
         systemInstruction=build_system_instruction(),
-        temperature=0.2,
-        topP=0.95,
-        maxOutputTokens=4_096,
+        temperature=0.0,
+        topP=0.8,
+        maxOutputTokens=2_048,
         automaticFunctionCalling=types.AutomaticFunctionCallingConfig(
             disable=False,
             maximumRemoteCalls=MAX_TOOL_CALLS,
@@ -684,7 +702,10 @@ async def execute_accounting_task(
         )
         return (response.text or "").strip()
 
-    summary = await asyncio.to_thread(_run_model)
+    summary = await asyncio.wait_for(
+        asyncio.to_thread(_run_model),
+        timeout=REQUEST_TIME_BUDGET_SECONDS,
+    )
     logger.info("Agent summary: %s", summary)
     logger.info("Tripletex call stats: %s", client.stats())
     return summary
