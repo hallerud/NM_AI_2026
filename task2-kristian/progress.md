@@ -36,22 +36,65 @@ ngrok http 8000
 # Submit URL: https://xxxx.ngrok-free.app/solve
 ```
 
+## Scoring Strategy — KEY FOCUS
+
+The efficiency bonus can **double** your score, but ONLY on perfect (1.0) correctness.
+A Tier 2 task: perfect + efficient = 4.0. Perfect + sloppy = ~2.1. Imperfect = 1.6 flat.
+
+**To maximize score:**
+1. GET everything needed before writing — GETs are free, build full picture first
+2. Every write must succeed first time — 4xx errors hurt even on eventually-correct tasks
+3. Zero retries — if an endpoint fails, fix your approach, don't retry the same body
+
+**Observed efficiency in recent runs:**
+- Best case: 1 write, 0 errors, 12s (product creation) → full efficiency bonus
+- Worst case: 12 writes, 8 errors, 123s (project task) → nearly zero efficiency bonus despite correct output
+
+**Highest-leverage fixes (do these first):**
+- `PUT /project` was failing 6× per run → fixed with GET-first rule in system prompt
+- `PUT /order/:invoice` with body → 422, retry → wasted write → fixed (action endpoints take NO body)
+- Agent retrying after bank account error → fixed (stop on first failure)
+- Product duplicate creation → fixed (check pre-fetched list before POST)
+
 ## Task Types & Results
 
 | Task | Tier | Result | Notes |
 |------|------|--------|-------|
-| Create departments | 1 | ✅ 100% | Clean |
+| Create departments | 1 | ✅ 100% | Clean, 1 write |
 | Create employee (basic) | 1 | ✅ 100% | Needs userType, department, employment record |
 | Create employee (from PDF) | 1 | ~45-59% | PDF parsing + employment/details still uncertain |
 | Register payment on invoice | 1 | ✅ 100% | PUT /invoice/{id}/:payment — fast, 2 iterations |
-| Create product | 1 | ✅ 100% | 1 iteration |
+| Create product | 1 | ✅ 100% | 1 write, 12s — perfect efficiency |
+| Create supplier | 1 | ✅ 100% | 1 write, clean |
+| Create invoice + send | 2 | ❌ 0% | Blocked by sandbox bank account — order created but invoice fails |
+| Credit note | 2 | ✅ working | PUT /invoice/{id}/:createCreditNote, no body |
 | Reverse payment (bounced) | 2 | ✅ working | PUT /ledger/voucher/{id}/:reverse |
+| Project with fixed price + partial invoice | 2/3 | ✅ 7/7 | Works but 8 failed writes → poor efficiency |
 | Travel expense | 2 | ~partial | perDiemCompensation + cost endpoints now known |
-| Bank reconciliation | 3 | ~20% | Customer payments work; supplier vouchers fail |
-| Project full lifecycle | 3 | ~partial | Timesheets work; invoice blocked by bank account |
+| Bank reconciliation (CSV) | 3 | ~50% | Customer payments work; supplier vouchers still flaky |
+| Ledger error correction | 3 | ❌ 0% | 403 proxy token errors — token may expire per task |
 | Supplier invoice (voucher) | 2 | unknown | Voucher structure now fixed in prompt |
+| Salary/payroll | ? | ❌ 0% | Endpoint completely unknown — needs discovery |
 
 ## Confirmed Working API Patterns
+
+### UNIVERSAL PUT RULE (applies everywhere)
+```
+ANY PUT to an existing entity:
+  1. GET /{endpoint}/{id} first → get current version number + all fields
+  2. PUT with ALL fields (including unchanged ones) + version number
+  3. Missing any required field or version → 422 "Kan ikke være null"
+Applies to: PUT /employee, PUT /project, PUT /customer, PUT /ledger/account, etc.
+Exception: action endpoints (/:invoice, /:payment, /:depreciate, /:reverse, /:send) — NO body unless stated
+```
+
+### Action Endpoints — NO BODY
+```
+PUT /order/{id}/:invoice       — no body, no params
+PUT /invoice/{id}/:send        — query param only: ?sendType=EMAIL
+PUT /invoice/{id}/:createCreditNote — no body
+PUT /ledger/voucher/{id}/:reverse   — no body
+```
 
 ### Employee — FULL FLOW
 ```
@@ -68,7 +111,19 @@ POST /employee/employment/details:
   employmentPercentage, annualWage OR monthlyWage, occupationCode (7-digit string), jobTitle
   ← NOT percentageOfFullTimeEquivalent, NOT annualSalary
 
-PUT /employee: always GET first for version, send ALL fields + version
+PUT /employee: GET first for version, send ALL fields + version
+```
+
+### Project — FULL FLOW
+```
+POST /project: name, projectManager:{id}, startDate, customer:{id}, isInternal:false
+  Optional: fixedprice (decimal), isFixedPrice:true, budget
+
+PUT /project/{id} to update (e.g. set fixed price):
+  GET /project/{id} first → grab version + all current fields
+  PUT with ALL fields + version + your changes
+  e.g.: {id, version, name, startDate, customer:{id}, projectManager:{id},
+         isInternal:false, isFixedPrice:true, fixedprice:429500}
 ```
 
 ### Voucher (manual journal / supplier invoice)
@@ -103,9 +158,10 @@ POST /activity: name, isProjectActivity:true
 
 ### Invoice / Payment
 ```
-PUT /invoice/{id}/:payment — works reliably
-GET /invoice — requires dateFrom and dateTo params
+PUT /invoice/{id}/:payment — body: {paymentDate, paymentTypeId (plain int!), paidAmount, paidAmountCurrency}
+GET /invoice — requires dateFrom and dateTo params (use 2020-01-01 to 2030-12-31 if unknown)
 PUT /order/{id}/:invoice — FAILS in sandbox ("company has no bank account", unfixable via API)
+  → stop after first failure, do NOT retry
 ```
 
 ### Other Confirmed Patterns
@@ -123,15 +179,44 @@ Bank account numbers from PDFs: strip ALL dots/spaces → must be exactly 11 dig
 
 ## Known Blockers
 
-1. **Invoice creation blocked in sandbox** — `PUT /order/{id}/:invoice` fails with "company has no bank account". Cannot be fixed via API (PUT /company returns 405). Affects project lifecycle scoring.
-2. **Voucher to 2400/2600** — these accounts are system-managed. Use 1920 (bank) as the credit side for supplier payments instead.
-3. **"Endpoint unreachable"** — caused by running without `--workers 3`. Single worker = sequential = tasks queue up and timeout.
+1. **Invoice creation blocked in sandbox** — `PUT /order/{id}/:invoice` fails with "company has no bank account". Cannot be fixed via API. Affects all invoice/project lifecycle tasks — accept partial score.
+2. **Voucher to 2400/2600** — system-managed accounts. Use 1920 (bank) as credit side for supplier payments.
+3. **"Endpoint unreachable"** — caused by running without `--workers 3`. Single worker = tasks queue and timeout.
+4. **Salary/payroll** — endpoints completely unknown. Agent guesses randomly and fails. Zero score until discovered.
+5. **Ledger error correction** — sometimes hits 403 (invalid/expired proxy token per-task). Nothing the agent can do.
+
+## What To Focus On Next (priority order)
+
+### 1. Discover salary/payroll endpoints (HIGH VALUE)
+The agent currently scores 0% on salary tasks. Need to manually explore:
+- `GET /salary/transaction?fields=*`
+- `GET /salary/payslip?fields=*`
+- `GET /salary/settings/pensionScheme?fields=*`
+Use the sandbox UI (https://kkpqfuj-amager.tripletex.dev) to run a payroll and inspect what API calls it makes.
+
+### 2. Fix efficiency on tasks we already get right (HIGH VALUE)
+Tasks we score 100% correctness on but waste writes:
+- Project tasks: now fixed in system prompt (GET-first rule for PUT /project)
+- Invoice tasks: now fixed (action endpoints take no body)
+- Re-run these to capture the efficiency bonus (can be 2× the base score)
+
+### 3. Discover remaining unknown task types (~15 unseen)
+Keep submitting to see new task types. When a new one appears, log the prompt + what worked/failed here.
+Known unseen: custom accounting dimensions, employee admin role, year-end closing, budget tasks, dimension values.
+
+### 4. Bank reconciliation reliability (MEDIUM)
+Currently ~50%. Supplier voucher postings still sometimes fail. Review voucher rules and test more.
+
+### 5. Employee from PDF (MEDIUM)
+~45-59%. The PDF parsing is hit-or-miss. Could improve by being more explicit in the prompt about
+which fields to extract and how to handle missing data.
 
 ## Still Unknown / To Discover
 
-1. **Custom accounting dimensions** — endpoint unknown. Task: create dimension "Region" with values.
-2. **Employee admin role** — "kontoadministrator" role fields unknown.
-3. **~18 task types unseen** — keep submitting to discover them.
+1. **Salary/payroll** — entire flow unknown. `/salary/transaction`, `/salary/payslip` return 500/404.
+2. **Custom accounting dimensions** — endpoint unknown. Task: create dimension "Region" with values.
+3. **Employee admin role** — "kontoadministrator" / administrator role assignment fields unknown.
+4. **~15 task types unseen** — keep submitting to discover them.
 
 ## API Quick Reference
 - Auth: Basic Auth, username `0`, password = session_token
