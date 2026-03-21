@@ -1,26 +1,22 @@
 #!/bin/bash
-#SBATCH --job-name=package
+#SBATCH --job-name=bm_tta
 #SBATCH --account=nn11127k
 #SBATCH --partition=accel
 #SBATCH --nodes=1
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=00:30:00
-#SBATCH --output=logs/package_%j.log
+#SBATCH --time=00:25:00
+#SBATCH --output=logs/bm_tta_%j.log
 
-# Usage: sbatch package.slurm v22_full_x_1280
-# Or:    sbatch package.slurm v22_full_x_1280 1600
+# Generic single-config benchmark job.
+# Usage: sbatch benchmark_parallel.slurm "--runs v63_x_full v41_x_long200 v64_l_full --ensemble --tta --wbf-iou 0.55"
 
 WORKDIR=/cluster/home/ksv023/NM_AI_2026/task1
 CONTAINER=/cluster/work/support/container/pytorch_nvidia_25.06_arm64.sif
 VENV=${WORKDIR}/venv
 
-RUN_NAME=${1:?Usage: sbatch package.slurm RUN_NAME [IMGSZ]}
-IMGSZ_ARG=""
-if [ -n "$2" ]; then
-    IMGSZ_ARG="--imgsz $2"
-fi
+ARGS=${1:?Usage: sbatch benchmark_parallel.slurm "BENCHMARK_ARGS"}
 
 mkdir -p ${WORKDIR}/logs
 
@@ -29,7 +25,8 @@ apptainer exec --nv \
     --bind /cluster/projects/nn11127k:/cluster/projects/nn11127k \
     ${CONTAINER} bash -c "
     source ${VENV}/bin/activate
+    export PYTHONNOUSERSITE=1
     export PYTHONPATH=${WORKDIR}/pylibs:\${PYTHONPATH}
     cd ${WORKDIR}
-    python3 package_model.py --run ${RUN_NAME} ${IMGSZ_ARG}
+    python3 benchmark.py ${ARGS}
 "
