@@ -1,38 +1,42 @@
-import base64
-from pathlib import Path
- 
-import requests
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
- 
+# main.py
+from fastapi import FastAPI
+import uvicorn
+import os
+
 app = FastAPI()
- 
+
+@app.get("/health")
+def health():
+    """
+    Health check endpoint for the competition validator.
+    """
+    return {"status": "ok"}
+
 @app.post("/solve")
-async def solve(request: Request):
-    body = await request.json()
-    prompt = body["prompt"]
-    files = body.get("files", [])
-    creds = body["tripletex_credentials"]
- 
-    base_url = creds["base_url"]
-    token = creds["session_token"]
-    auth = ("0", token)
- 
-    for f in files:
-        data = base64.b64decode(f["content_base64"])
-        Path(f["filename"]).write_bytes(data)
- 
-    # TODO: Use an LLM to interpret the prompt and execute
-    # the appropriate Tripletex API calls
- 
-    return JSONResponse({"status": "completed"})
+async def solve(request: dict):
+    """
+    Main endpoint for competition tasks.
+    Receives prompt and credentials, and returns a status.
+    """
+    prompt = request.get("prompt", "")
+    credentials = request.get("tripletex_credentials", {})
 
+    # Your AI agent logic will go here:
+    # 1. Parse the prompt
+    # 2. Call external APIs (e.g., Tripletex) using provided credentials
+    # 3. Implement your solution to the accounting task
 
+    print(f"Received prompt: {prompt}")
+    print(f"Received credentials (Tripletex): {credentials}")
 
+    # For now, we'll just return a 'completed' status.
+    # You'll replace this with your actual task completion logic.
+    return {"status": "completed", "message": "Task received and processed by skeleton."}
 
-
-
-
+if __name__ == "__main__":
+    # Get port from environment variable, default to 8080 for Cloud Run
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 
 
