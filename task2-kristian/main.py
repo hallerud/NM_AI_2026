@@ -347,13 +347,27 @@ Plan your steps, then execute efficiently."""
     contents = [types.Content(role="user", parts=parts)]
 
     tag = f"[{rid}] " if rid else ""
+
+    # ── Per-task stats tracking ───────────────────────────────────────────────
+    stats = {
+        "iterations": 0,
+        "write_calls": 0,   # POST/PUT/DELETE/PATCH — these cost efficiency score
+        "errors_4xx": 0,    # Client errors — also hurt score
+        "calls": [],        # (method, endpoint, status, error_msg)
+        "stop_reason": "max_iterations",
+    }
+
+    WRITE_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
+
     for i in range(15):
         elapsed = time.time() - start
         if elapsed > 200:
-            print(f"{tag}  ⏱ {elapsed:.0f}s — stopping.")
+            stats["stop_reason"] = f"timeout ({elapsed:.0f}s)"
+            print(f"{tag}  ⏱ {elapsed:.0f}s — hard stop.")
             break
 
-        print(f"\n{tag}--- Iteration {i+1} ({elapsed:.0f}s) ---")
+        stats["iterations"] = i + 1
+        print(f"\n{tag}── Iter {i+1} ({elapsed:.0f}s) " + "─" * 40)
 
         try:
             resp = client.models.generate_content(
@@ -371,20 +385,23 @@ Plan your steps, then execute efficiently."""
                 print("  ⚠ Rate limited — waiting 30s...")
                 time.sleep(30)
                 continue
+            stats["stop_reason"] = f"gemini_error: {e}"
             break
 
         candidate = resp.candidates[0]
         response_parts = candidate.content.parts
 
         for part in response_parts:
-            if getattr(part, "text", None):
-                print(f"{tag}  💭 {part.text[:400]}")
+            if getattr(part, "text", None) and part.text.strip():
+                # Show full agent reasoning — helps understand decisions
+                print(f"{tag}  💭 {part.text.strip()[:800]}")
 
         # Collect function calls
         fn_calls = [p for p in response_parts if p.function_call]
         if not fn_calls:
-            print("  ✅ Done")
-            return
+            stats["stop_reason"] = "agent_done"
+            print(f"\n{tag}  ✅ Agent signalled completion.")
+            break
 
         # Add model turn to history
         contents.append(candidate.content)
@@ -399,23 +416,59 @@ Plan your steps, then execute efficiently."""
             params   = _to_dict(inp.get("params"))
             body     = _to_dict(inp.get("body"))
 
-            print(f"{tag}  🔧 {method} {endpoint}", end="")
+            is_write = method.upper() in WRITE_METHODS
+            call_icon = "✏️ " if is_write else "🔍"
+            print(f"{tag}  {call_icon} {method} {endpoint}", end="")
             if body:
-                print(f"  {json.dumps(body)[:150]}", end="")
+                print(f"  body={json.dumps(body)[:200]}", end="")
             print()
 
             result = tx(method, base_url, token, endpoint, params=params, body=body)
             status = result.get("status_code", 0)
-            print(f"{tag}     → {status}")
 
+            if is_write:
+                stats["write_calls"] += 1
+
+            # Parse error details fully for human readability
+            error_summary = None
             if status >= 400:
+                stats["errors_4xx"] += 1
                 d = result.get("data", {})
+                error_parts = []
                 if isinstance(d, dict):
                     for key in ("message", "developerMessage"):
                         if d.get(key):
-                            print(f"{tag}     ❌ {d[key][:200]}")
-                    for v in (d.get("validationMessages") or [])[:3]:
-                        print(f"{tag}     ⚠ {v.get('message', v)}")
+                            error_parts.append(d[key])
+                    for v in (d.get("validationMessages") or []):
+                        msg = v.get("message", "") if isinstance(v, dict) else str(v)
+                        field = v.get("field", "") if isinstance(v, dict) else ""
+                        error_parts.append(f"  field={field!r}: {msg}" if field else f"  {msg}")
+                error_summary = " | ".join(error_parts[:1]) if error_parts else f"HTTP {status}"
+                status_icon = "🚫" if status == 403 else "❌"
+                print(f"{tag}     {status_icon} {status} — {error_parts[0][:300] if error_parts else ''}")
+                for ep in error_parts[1:]:
+                    print(f"{tag}        {ep[:200]}")
+            else:
+                # Show created/updated ID on success for write calls
+                if is_write and status in (200, 201):
+                    d = result.get("data", {})
+                    created_id = None
+                    if isinstance(d, dict):
+                        v = d.get("value", {})
+                        if isinstance(v, dict):
+                            created_id = v.get("id")
+                    id_str = f" → id={created_id}" if created_id else ""
+                    print(f"{tag}     ✅ {status}{id_str}")
+                else:
+                    print(f"{tag}     ✅ {status}")
+
+            stats["calls"].append({
+                "method": method,
+                "endpoint": endpoint,
+                "status": status,
+                "error": error_summary,
+                "is_write": is_write,
+            })
 
             r_str = json.dumps(result, ensure_ascii=False, default=str)
             if len(r_str) > 6000:
@@ -435,7 +488,39 @@ Plan your steps, then execute efficiently."""
 
         contents.append(types.Content(role="user", parts=tool_response_parts))
 
-    print(f"{tag}Max iterations reached")
+    # ── Final summary ─────────────────────────────────────────────────────────
+    elapsed = time.time() - start
+    failed_writes = [c for c in stats["calls"] if c["is_write"] and c["status"] >= 400]
+    ok_writes     = [c for c in stats["calls"] if c["is_write"] and c["status"] < 400]
+
+    print(f"\n{tag}" + "═" * 54)
+    print(f"{tag} SUMMARY  [{rid}]  stop={stats['stop_reason']}  time={elapsed:.0f}s")
+    print(f"{tag}{'─' * 54}")
+    print(f"{tag}  Iterations : {stats['iterations']}/15")
+    print(f"{tag}  Write calls: {stats['write_calls']}  (✅ {len(ok_writes)} ok  ❌ {len(failed_writes)} failed)")
+    print(f"{tag}  4xx errors : {stats['errors_4xx']}")
+
+    if ok_writes:
+        print(f"{tag}  ── Successful writes:")
+        for c in ok_writes:
+            print(f"{tag}     {c['method']} {c['endpoint']}  [{c['status']}]")
+
+    if failed_writes:
+        print(f"{tag}  ── Failed writes (hurt score!):")
+        for c in failed_writes:
+            print(f"{tag}     {c['method']} {c['endpoint']}  [{c['status']}] — {c['error'] or ''}")
+
+    # Spot patterns: repeated failures on same endpoint = likely missing knowledge
+    from collections import Counter
+    fail_endpoints = Counter(
+        f"{c['method']} {c['endpoint']}" for c in stats["calls"] if c["status"] >= 400
+    )
+    if fail_endpoints:
+        print(f"{tag}  ── Error frequency (fix these in system prompt):")
+        for ep, cnt in fail_endpoints.most_common():
+            print(f"{tag}     {cnt}x  {ep}")
+
+    print(f"{tag}" + "═" * 54)
 
 
 # ── FastAPI endpoint ──────────────────────────────────────────────────────────
