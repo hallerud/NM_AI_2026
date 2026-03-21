@@ -14,3 +14,5 @@
 - Added a `__main__` entrypoint so running `main.py` directly starts the FastAPI server while keeping the competition endpoint behavior unchanged.
 - Updated the Gemini client builder so the program actually uses the API key defined inside `main.py`, with env vars kept as fallback.
 - Optimized latency by switching the default Gemini path to a faster flash model, removing the startup Tripletex probe, shrinking prompt/tool budgets, and adding a request time budget.
+- Added direct task-family endpoint hints and a second forced-action Gemini pass so the agent is less likely to spend all tool calls on reads without making the required write.
+- Added terminal task-run reporting that prints the task prompt, whether the run appears to have succeeded, Tripletex call counts, and the concrete failure reason when it does not.

@@ -5,6 +5,8 @@ import logging
 import os
 import re
 import time
+import traceback
+import uuid
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -27,10 +29,12 @@ TRIPLETEX_TIMEOUT_SECONDS = 30
 EXPECTED_ENDPOINT_API_KEY = os.getenv("TRIPLETEX_ENDPOINT_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
 SPEC_PATH = Path(__file__).with_name("tripletex.json")
-MAX_TOOL_CALLS = 12
+MAX_TOOL_CALLS = 24
 MAX_ATTACHMENT_BYTES_FOR_MODEL = 8 * 1024 * 1024
 MAX_TOOL_RESULT_CHARS = 8_000
 REQUEST_TIME_BUDGET_SECONDS = int(os.getenv("REQUEST_TIME_BUDGET_SECONDS", "240"))
+PRIMARY_TOOL_CALL_BUDGET = 8
+ACTION_TOOL_CALL_BUDGET = 6
 
 app = FastAPI(
     title="Tripletex AI Accounting Agent",
@@ -64,6 +68,18 @@ class SolveResponse(BaseModel):
 
 
 @dataclass
+class TaskRunReport:
+    run_id: str
+    task_prompt: str
+    write_calls: int
+    read_calls: int
+    write_errors: int
+    success: bool
+    failure_reason: str | None = None
+    summary: str | None = None
+
+
+@dataclass
 class PreparedAttachment:
     filename: str
     mime_type: str
@@ -83,6 +99,50 @@ class EndpointDoc:
     parameters: list[dict[str, Any]]
     request_body_schema: dict[str, Any] | None
     request_body_required: bool
+
+
+TASK_FAMILY_HINTS: list[dict[str, Any]] = [
+    {
+        "keywords": ["employee", "ansatt", "administrator", "admin", "kontoadministrator"],
+        "endpoints": [("POST", "/employee"), ("GET", "/employee")],
+        "hint": "Employee creation or update task. Find existing employee first if this sounds like an update.",
+    },
+    {
+        "keywords": ["customer", "kunde"],
+        "endpoints": [("POST", "/customer"), ("GET", "/customer")],
+        "hint": "Customer task. Create only if the customer does not already exist.",
+    },
+    {
+        "keywords": ["product", "produkt", "item", "vare"],
+        "endpoints": [("POST", "/product"), ("GET", "/product")],
+        "hint": "Product task. Prefer one create call after checking if the product already exists.",
+    },
+    {
+        "keywords": ["invoice", "faktura", "credit", "kreditnota"],
+        "endpoints": [("POST", "/invoice"), ("GET", "/invoice"), ("POST", "/order"), ("GET", "/order")],
+        "hint": "Invoice-like task. You may need an order/customer prerequisite before the invoice write.",
+    },
+    {
+        "keywords": ["project", "prosjekt"],
+        "endpoints": [("POST", "/project"), ("GET", "/project")],
+        "hint": "Project task. Check whether a customer link is required.",
+    },
+    {
+        "keywords": ["department", "avdeling", "hr", "sales", "finance"],
+        "endpoints": [("POST", "/department"), ("GET", "/department")],
+        "hint": "Department task. Search departments first if the prompt sounds like bookkeeping to an existing department.",
+    },
+    {
+        "keywords": ["travel", "reise", "utlegg", "expense", "receipt", "kvittering", "bokfort", "bokfør"],
+        "endpoints": [("POST", "/travelExpense"), ("GET", "/travelExpense"), ("GET", "/ledger/account")],
+        "hint": "Expense or receipt task. Use receipt details and department/account lookups, then post the travel expense or voucher with correct VAT handling.",
+    },
+    {
+        "keywords": ["voucher", "bilag", "ledger", "mva", "vat", "expense account", "utgiftskonto"],
+        "endpoints": [("POST", "/ledger/voucher"), ("GET", "/ledger/account"), ("GET", "/department")],
+        "hint": "Ledger/voucher bookkeeping task. Read ledger accounts first, then create the smallest correct voucher/write.",
+    },
+]
 
 
 def normalize_text(text: str) -> str:
@@ -114,6 +174,34 @@ def build_attachment_summary(attachments: list["PreparedAttachment"]) -> str:
             preview = normalize_text(attachment.content_text_preview)[:300]
             line += f" preview={preview}"
         lines.append(line)
+    return "\n".join(lines)
+
+
+def guess_task_family_hints(prompt: str) -> list[dict[str, Any]]:
+    prompt_lower = prompt.lower()
+    matches: list[dict[str, Any]] = []
+    for hint in TASK_FAMILY_HINTS:
+        if any(keyword in prompt_lower for keyword in hint["keywords"]):
+            matches.append(hint)
+    return matches[:3]
+
+
+def build_direct_endpoint_hints(catalog: "OpenAPICatalog", prompt: str) -> str:
+    matched_hints = guess_task_family_hints(prompt)
+    if not matched_hints:
+        return "- No direct heuristic hint available"
+
+    lines: list[str] = []
+    for hint in matched_hints:
+        lines.append(f"- {hint['hint']}")
+        for method, path in hint["endpoints"][:3]:
+            try:
+                details = catalog.details(method, path)
+            except ValueError:
+                continue
+            lines.append(
+                f"  {details['method']} {details['path']} - {details['summary']}"
+            )
     return "\n".join(lines)
 
 
@@ -572,6 +660,7 @@ When done, answer with a very short plain-language summary.
 def build_task_prompt(request: SolveRequest, attachments: list[PreparedAttachment], catalog: OpenAPICatalog) -> str:
     attachment_summary = build_attachment_summary(attachments)
     initial_candidates = catalog.search(request.prompt, limit=6)
+    direct_hints = build_direct_endpoint_hints(catalog, request.prompt)
 
     return f"""
 Task prompt:
@@ -582,6 +671,9 @@ Attachments:
 
 Candidate endpoints from the local OpenAPI search:
 {compact_json(initial_candidates, max_chars=3_500)}
+
+Direct heuristic endpoint hints:
+{direct_hints}
 
 Remember:
 - You are working against a fresh Tripletex competition account unless the prompt implies otherwise.
@@ -622,6 +714,54 @@ def build_contents(task_prompt: str, attachments: list[PreparedAttachment]) -> l
     return contents
 
 
+def build_action_prompt(request: SolveRequest, attachments: list[PreparedAttachment], catalog: OpenAPICatalog) -> str:
+    return f"""
+You have already spent read/tool budget and still have not written anything.
+
+Your task now is to finish decisively.
+- This competition task is expected to change state in Tripletex.
+- Prefer at most 1-2 additional GET calls before the first write.
+- If the exact endpoint family is clear, stop searching and act.
+- If account/VAT handling is involved, use `GET /ledger/account` and the prompt/attachment cues, then write the result.
+- If a department is named, search the department and include it in the write.
+- Do not end without attempting the required write unless the prompt is truly impossible.
+
+Task prompt:
+{request.prompt}
+
+Attachments:
+{build_attachment_summary(attachments)}
+
+Direct heuristic endpoint hints:
+{build_direct_endpoint_hints(catalog, request.prompt)}
+""".strip()
+
+
+def summarize_task_prompt(prompt: str, *, max_length: int = 160) -> str:
+    normalized = normalize_text(prompt)
+    if len(normalized) <= max_length:
+        return normalized
+    return f"{normalized[:max_length]}..."
+
+
+def log_task_report(report: TaskRunReport) -> None:
+    logger.info("=== Task Result ===")
+    logger.info("Run ID: %s", report.run_id)
+    logger.info("Task: %s", summarize_task_prompt(report.task_prompt))
+    logger.info("Success: %s", "yes" if report.success else "no")
+    logger.info(
+        "Tripletex calls: reads=%s writes=%s write_errors=%s",
+        report.read_calls,
+        report.write_calls,
+        report.write_errors,
+    )
+    if report.failure_reason:
+        logger.info("Failure reason: %s", report.failure_reason)
+    if report.summary:
+        logger.info("Model summary: %s", report.summary)
+    logger.info("===================")
+
+
 def parse_json_string(value: str | None, *, default: Any) -> Any:
     if value is None or not value.strip():
         return default
@@ -630,6 +770,7 @@ def parse_json_string(value: str | None, *, default: Any) -> Any:
 
 
 async def execute_accounting_task(
+    run_id: str,
     request: SolveRequest,
     client: TripletexClient,
     attachments: list[PreparedAttachment],
@@ -638,7 +779,8 @@ async def execute_accounting_task(
     gemini_client = build_gemini_client()
 
     logger.info(
-        "Received task. prompt=%s attachments=%s",
+        "Received task. run_id=%s prompt=%s attachments=%s",
+        run_id,
         request.prompt,
         len(attachments),
     )
@@ -676,36 +818,60 @@ async def execute_accounting_task(
         return {"stats": client.stats(), "result": prune_for_model(payload)}
 
     tool_names = ["search_api", "get_api_details", "tripletex_get", "tripletex_write"]
-    config = types.GenerateContentConfig(
-        systemInstruction=build_system_instruction(),
-        temperature=0.0,
-        topP=0.8,
-        maxOutputTokens=2_048,
-        automaticFunctionCalling=types.AutomaticFunctionCallingConfig(
-            disable=False,
-            maximumRemoteCalls=MAX_TOOL_CALLS,
-        ),
-        toolConfig=types.ToolConfig(
-            functionCallingConfig=types.FunctionCallingConfig(
-                mode=types.FunctionCallingConfigMode.ANY,
-                allowedFunctionNames=tool_names,
-            )
-        ),
-        tools=[search_api, get_api_details, tripletex_get, tripletex_write],
-    )
 
-    def _run_model() -> str:
+    def _run_model(prompt_text: str, allowed_tools: list[Any], allowed_tool_names: list[str], remote_call_budget: int) -> str:
+        config = types.GenerateContentConfig(
+            systemInstruction=build_system_instruction(),
+            temperature=0.0,
+            topP=0.8,
+            maxOutputTokens=2_048,
+            automaticFunctionCalling=types.AutomaticFunctionCallingConfig(
+                disable=False,
+                maximumRemoteCalls=remote_call_budget,
+            ),
+            toolConfig=types.ToolConfig(
+                functionCallingConfig=types.FunctionCallingConfig(
+                    mode=types.FunctionCallingConfigMode.ANY,
+                    allowedFunctionNames=allowed_tool_names,
+                )
+            ),
+            tools=allowed_tools,
+        )
         response = gemini_client.models.generate_content(
             model=GEMINI_MODEL,
-            contents=build_contents(task_prompt, attachments),
+            contents=build_contents(prompt_text, attachments),
             config=config,
         )
         return (response.text or "").strip()
 
     summary = await asyncio.wait_for(
-        asyncio.to_thread(_run_model),
+        asyncio.to_thread(
+            _run_model,
+            task_prompt,
+            [search_api, get_api_details, tripletex_get, tripletex_write],
+            tool_names,
+            PRIMARY_TOOL_CALL_BUDGET,
+        ),
         timeout=REQUEST_TIME_BUDGET_SECONDS,
     )
+
+    if client.write_calls == 0:
+        logger.warning("Primary pass completed without writes. Starting forced action pass.")
+        remaining_budget = max(30, REQUEST_TIME_BUDGET_SECONDS // 3)
+        action_prompt = build_action_prompt(request, attachments, catalog)
+        forced_summary = await asyncio.wait_for(
+            asyncio.to_thread(
+                _run_model,
+                action_prompt,
+                [get_api_details, tripletex_get, tripletex_write],
+                ["get_api_details", "tripletex_get", "tripletex_write"],
+                ACTION_TOOL_CALL_BUDGET,
+            ),
+            timeout=remaining_budget,
+        )
+        if forced_summary:
+            summary = forced_summary
+
     logger.info("Agent summary: %s", summary)
     logger.info("Tripletex call stats: %s", client.stats())
     return summary
@@ -718,16 +884,42 @@ async def solve(
 ) -> JSONResponse:
     validate_endpoint_api_key(authorization)
 
+    run_id = str(uuid.uuid4())[:8]
     attachments = [prepare_attachment(file) for file in request_body.files]
     tripletex_client = TripletexClient(
         base_url=request_body.tripletex_credentials.base_url,
         session_token=request_body.tripletex_credentials.session_token,
     )
 
+    summary: str | None = None
+    failure_reason: str | None = None
     try:
-        await execute_accounting_task(request_body, tripletex_client, attachments)
+        summary = await execute_accounting_task(run_id, request_body, tripletex_client, attachments)
     except Exception:  # noqa: BLE001
+        failure_reason = traceback.format_exc(limit=3)
         logger.exception("Unhandled execution error")
+
+    success = tripletex_client.write_calls > 0 and tripletex_client.write_errors == 0
+    if not success and not failure_reason:
+        if tripletex_client.write_calls == 0:
+            failure_reason = "The model completed without making any Tripletex write calls."
+        elif tripletex_client.write_errors > 0:
+            failure_reason = f"The model made {tripletex_client.write_errors} failing write call(s)."
+        else:
+            failure_reason = "The task did not reach a confident success state."
+
+    log_task_report(
+        TaskRunReport(
+            run_id=run_id,
+            task_prompt=request_body.prompt,
+            write_calls=tripletex_client.write_calls,
+            read_calls=tripletex_client.read_calls,
+            write_errors=tripletex_client.write_errors,
+            success=success,
+            failure_reason=failure_reason,
+            summary=summary,
+        )
+    )
 
     return JSONResponse(content=SolveResponse().model_dump())
 
