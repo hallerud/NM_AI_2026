@@ -12,4 +12,5 @@
 - Updated local runtime files to use Gemini instead of Anthropic by changing `requirements.txt` and `start.sh`.
 - Reapplied the function-call-only Gemini tool configuration and removed the stray `/health` route after a failed earlier file update.
 - Added a `__main__` entrypoint so running `main.py` directly starts the FastAPI server while keeping the competition endpoint behavior unchanged.
+- Updated the Gemini client builder so the program actually uses the API key defined inside `main.py`, with env vars kept as fallback.
 

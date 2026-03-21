@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("tripletex-agent")
 
+GEMINI_API_KEY = "AIzaSyBI2N7eEJcn9-TUaizlJJMOuJtQIInOJHs"
 TRIPLETEX_TIMEOUT_SECONDS = 30
 EXPECTED_ENDPOINT_API_KEY = os.getenv("TRIPLETEX_ENDPOINT_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
@@ -518,9 +519,9 @@ def prepare_attachment(attachment: FileAttachment) -> PreparedAttachment:
 
 
 def build_gemini_client() -> genai.Client:
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    api_key = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
-        raise RuntimeError("Missing GEMINI_API_KEY or GOOGLE_API_KEY.")
+        raise RuntimeError("Missing Gemini API key.")
     return genai.Client(api_key=api_key)
 
 
