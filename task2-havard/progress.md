@@ -16,3 +16,4 @@
 - Optimized latency by switching the default Gemini path to a faster flash model, removing the startup Tripletex probe, shrinking prompt/tool budgets, and adding a request time budget.
 - Added direct task-family endpoint hints and a second forced-action Gemini pass so the agent is less likely to spend all tool calls on reads without making the required write.
 - Added terminal task-run reporting that prints the task prompt, whether the run appears to have succeeded, Tripletex call counts, and the concrete failure reason when it does not.
+- Replaced Gemini automatic function calling with a manual tool loop so the agent can detect read-only stalls, inject corrective steering, and push the model toward the required write when it starts circling.

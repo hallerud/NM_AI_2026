@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 import uvicorn
@@ -818,6 +818,12 @@ async def execute_accounting_task(
         return {"stats": client.stats(), "result": prune_for_model(payload)}
 
     tool_names = ["search_api", "get_api_details", "tripletex_get", "tripletex_write"]
+    tool_map: dict[str, Callable[..., dict[str, Any]]] = {
+        "search_api": search_api,
+        "get_api_details": get_api_details,
+        "tripletex_get": tripletex_get,
+        "tripletex_write": tripletex_write,
+    }
 
     def _run_model(prompt_text: str, allowed_tools: list[Any], allowed_tool_names: list[str], remote_call_budget: int) -> str:
         config = types.GenerateContentConfig(
@@ -825,10 +831,6 @@ async def execute_accounting_task(
             temperature=0.0,
             topP=0.8,
             maxOutputTokens=2_048,
-            automaticFunctionCalling=types.AutomaticFunctionCallingConfig(
-                disable=False,
-                maximumRemoteCalls=remote_call_budget,
-            ),
             toolConfig=types.ToolConfig(
                 functionCallingConfig=types.FunctionCallingConfig(
                     mode=types.FunctionCallingConfigMode.ANY,
@@ -837,12 +839,104 @@ async def execute_accounting_task(
             ),
             tools=allowed_tools,
         )
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=build_contents(prompt_text, attachments),
-            config=config,
-        )
-        return (response.text or "").strip()
+        history: list[Any] = build_contents(prompt_text, attachments)
+        remote_calls_used = 0
+        read_only_rounds = 0
+        no_call_rounds = 0
+        last_text = ""
+
+        while remote_calls_used < remote_call_budget:
+            response = gemini_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=history,
+                config=config,
+            )
+
+            candidate = response.candidates[0] if response.candidates else None
+            content = candidate.content if candidate and candidate.content else None
+            parts = content.parts if content and content.parts else []
+
+            function_calls: list[Any] = []
+            text_parts: list[str] = []
+            for part in parts:
+                if getattr(part, "text", None):
+                    text_parts.append(part.text)
+                function_call = getattr(part, "function_call", None)
+                if function_call:
+                    function_calls.append(function_call)
+
+            if text_parts:
+                last_text = "\n".join(text_parts).strip()
+
+            if not function_calls:
+                no_call_rounds += 1
+                if client.write_calls == 0 and no_call_rounds <= 2:
+                    history.append(
+                        types.Content(
+                            role="user",
+                            parts=[
+                                types.Part(
+                                    text=(
+                                        "This task requires a Tripletex state change. "
+                                        "Use the available tools and make the needed write now."
+                                    )
+                                )
+                            ],
+                        )
+                    )
+                    continue
+                return last_text
+
+            if content:
+                history.append(content)
+
+            function_response_parts: list[types.Part] = []
+            writes_before_round = client.write_calls
+            for function_call in function_calls:
+                if remote_calls_used >= remote_call_budget:
+                    break
+
+                tool = tool_map[function_call.name]
+                try:
+                    result = tool(**(function_call.args or {}))
+                except Exception as exc:  # noqa: BLE001
+                    result = {
+                        "error": str(exc),
+                        "stats": client.stats(),
+                    }
+                function_response_parts.append(
+                    types.Part.from_function_response(
+                        name=function_call.name,
+                        response=result,
+                    )
+                )
+                remote_calls_used += 1
+
+            if function_response_parts:
+                history.append(types.Content(role="user", parts=function_response_parts))
+
+            if client.write_calls == writes_before_round:
+                read_only_rounds += 1
+            else:
+                read_only_rounds = 0
+
+            if client.write_calls == 0 and read_only_rounds >= 2 and remote_calls_used < remote_call_budget:
+                history.append(
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part(
+                                text=(
+                                    "You are spending too many tool calls on reads. "
+                                    "Stop exploring. If the endpoint family is clear, make the required write now. "
+                                    "Use at most one more GET before the first write."
+                                )
+                            )
+                        ],
+                    )
+                )
+
+        return last_text
 
     summary = await asyncio.wait_for(
         asyncio.to_thread(
