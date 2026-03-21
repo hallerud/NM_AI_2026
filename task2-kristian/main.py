@@ -123,7 +123,7 @@ TOOLS = [types.Tool(function_declarations=[
 
 def _build_system_prompt(today: str) -> str:
     return f"""You are an expert Tripletex (Norwegian ERP) accounting agent.
-Complete tasks using the Tripletex v2 REST API. Tasks may be in any of: NO, EN, DE, ES, PT, FR.
+Complete tasks using the Tripletex v2 REST API. Tasks may be in any of: NO (Bokmål), NN (Nynorsk), EN, DE, ES, PT, FR.
 Today: {today}
 
 ## SCORING — READ THIS FIRST
@@ -312,8 +312,8 @@ Hourly wage: use #2001, rate=hourly_rate, count=hours_worked.
 The salary type IDs are in pre-fetched context under salary_types — use them directly.
 NOT WORKING: /salary/transaction (403), /salary/specification (403), /salary/payment (404), /salary/run (404)
 
-### Custom Accounting Dimensions (kostsenter / dimensjon)
-STOP IMMEDIATELY if task mentions: kostsenter, dimensjon, dimension, cost center, Kostenstelle, centre de coûts.
+### Custom Accounting Dimensions (kostsenter / kostnadssenter / dimensjon)
+STOP IMMEDIATELY if task mentions: kostsenter, kostnadssenter, dimensjon, dimension, cost center, Kostenstelle, centre de coûts.
 These endpoints do NOT exist in the Tripletex API. After 2 GET attempts returning 404/403, report what you tried and say DONE.
 
 ### Travel Expense
@@ -329,10 +329,11 @@ POST /travelExpense/cost — travelExpense:{{id}}, amountCurrencyIncVat, payment
 excl. VAT / uten mva / ohne MwSt → isPrioritizeAmountsIncludingVat:false, unitPriceExcludingVatCurrency
 incl. VAT / inkl. mva / mit MwSt → isPrioritizeAmountsIncludingVat:true, unitPriceIncludingVatCurrency
 
-## TRANSLATIONS
+## TRANSLATIONS (Bokmål + Nynorsk + other languages)
 faktura/Rechnung/facture = invoice | leverandørfaktura/Lieferantenrechnung = SUPPLIER INVOICE (voucher!)
 reiseregning = travel expense | avdeling/Abteilung = department | kreditnota/Gutschrift = credit note
-bilag/Beleg/pièce = voucher | avskrivning/Abschreibung = depreciation | fastpris/Festpreis = fixed price project
+bilag/Beleg/pièce = voucher | avskrivning/avskriving/Abschreibung = depreciation | fastpris/Festpreis = fixed price project
+ansatt/tilsett = employee | lønn/løn = salary | kostsenter/kostnadssenter = cost center (UNSUPPORTED)
 """
 
 
@@ -351,17 +352,17 @@ def detect_task_type(prompt: str) -> str:
         (["reiseregning", "travel expense", "note de frais", "gastos de viaje", "reisekost"], "Travel Expense"),
         (["kreditnota", "credit note", "gutschrift", "nota de crédito", "note de crédit"],     "Credit Note"),
         (["leverandørfaktura", "supplier invoice", "lieferantenrechnung", "factura de proveedor", "facture fournisseur"], "Supplier Invoice"),
-        (["avskrivning", "depreciation", "abschreibung", "amortissement", "depreciación"],     "Depreciation"),
+        (["avskrivning", "avskriving", "depreciation", "abschreibung", "amortissement", "depreciación"],     "Depreciation"),
         (["bankavst", "bank reconciliation", "bankabstimmung", "conciliación bancaria"],       "Bank Reconciliation"),
-        (["kostsenter", "dimensjon", "dimension", "cost center", "kostenstelle", "centre de coûts"], "Custom Dimensions (UNSUPPORTED)"),
-        (["feil i bilag", "korriger bilag", "voucher error", "correct the voucher", "fehlerkorrektur", "corrección de errores", "feil postering"], "Voucher Error Correction"),
+        (["kostsenter", "dimensjon", "dimension", "cost center", "kostenstelle", "centre de coûts", "kostnadssenter"], "Custom Dimensions (UNSUPPORTED)"),
+        (["feil i bilag", "korriger bilag", "rett opp bilag", "voucher error", "correct the voucher", "fehlerkorrektur", "corrección de errores", "feil postering"], "Voucher Error Correction"),
         (["faktura", "invoice", "rechnung", "factura", "facture"],                             "Invoice"),
-        (["ansatt", "employee", "empleado", "mitarbeiter", "employé", "ansette"],              "Employee"),
+        (["ansatt", "employee", "empleado", "mitarbeiter", "employé", "ansette", "tilsett", "tilsette"],              "Employee"),
         (["prosjekt", "project", "proyecto", "projet", "projekt"],                             "Project"),
         (["avdeling", "department", "abteilung", "département", "departamento"],               "Department"),
         (["leverandør", "supplier", "lieferant", "fournisseur", "proveedor"],                  "Supplier"),
         (["timesheet", "timeregistr", "timer ", "tidsregistr", "horas trabajadas"],            "Timesheet"),
-        (["lønn", "payroll", "salary", "lohn", "salaire", "nómina"],                          "Salary/Payroll"),
+        (["lønn", "payroll", "salary", "lohn", "salaire", "nómina", "løn "],                          "Salary/Payroll"),
         (["bilag", "voucher", "beleg", "pièce comptable"],                                     "Voucher"),
         (["produkt", "product", "producto", "produit"],                                        "Product"),
         (["kunde", "customer", "cliente", "client"],                                           "Customer"),
