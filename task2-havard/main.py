@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import re
-import time
 import traceback
 import uuid
 from dataclasses import dataclass
@@ -12,7 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
-import requests
+import httpx
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
@@ -99,6 +98,10 @@ class EndpointDoc:
     parameters: list[dict[str, Any]]
     request_body_schema: dict[str, Any] | None
     request_body_required: bool
+    searchable_text: str
+    searchable_tokens: set[str]
+    path_lower: str
+    summary_lower: str
 
 
 TASK_FAMILY_HINTS: list[dict[str, Any]] = [
@@ -236,6 +239,7 @@ class OpenAPICatalog:
         self.schemas = self.spec.get("components", {}).get("schemas", {})
         self.endpoint_docs = self._build_endpoint_docs()
         self.endpoint_lookup = {(doc.method, doc.path): doc for doc in self.endpoint_docs}
+        self.search_cache: dict[tuple[str, str | None, int], list[dict[str, Any]]] = {}
 
     def _resolve_ref(self, ref: str) -> dict[str, Any]:
         if not ref.startswith("#/components/schemas/"):
@@ -333,6 +337,17 @@ class OpenAPICatalog:
                     )
 
                 request_body_schema, request_body_required = self._request_body_schema(operation)
+                searchable_text = " ".join(
+                    [
+                        method.upper(),
+                        path,
+                        str(operation.get("operationId", "")),
+                        normalize_text(str(operation.get("summary", ""))),
+                        normalize_text(str(operation.get("description", ""))),
+                        " ".join(operation.get("tags", [])),
+                        " ".join(param["name"] for param in parameters if param.get("name")),
+                    ]
+                ).lower()
                 docs.append(
                     EndpointDoc(
                         method=method.upper(),
@@ -344,6 +359,10 @@ class OpenAPICatalog:
                         parameters=parameters,
                         request_body_schema=request_body_schema,
                         request_body_required=request_body_required,
+                        searchable_text=searchable_text,
+                        searchable_tokens=tokenize(searchable_text),
+                        path_lower=path.lower(),
+                        summary_lower=normalize_text(str(operation.get("summary", ""))).lower(),
                     )
                 )
         return docs
@@ -351,6 +370,10 @@ class OpenAPICatalog:
     def search(self, query: str, method: str | None = None, *, limit: int = 8) -> list[dict[str, Any]]:
         query_tokens = tokenize(query)
         filtered_method = method.upper() if method else None
+        cache_key = (query.lower(), filtered_method, limit)
+        cached = self.search_cache.get(cache_key)
+        if cached is not None:
+            return cached
         scored: list[tuple[float, EndpointDoc]] = []
         domain_prefix_boosts = {
             "employee": "/employee",
@@ -380,25 +403,12 @@ class OpenAPICatalog:
             if filtered_method and doc.method != filtered_method:
                 continue
 
-            haystack = " ".join(
-                [
-                    doc.method,
-                    doc.path,
-                    doc.operation_id,
-                    doc.summary,
-                    doc.description,
-                    " ".join(doc.tags),
-                    " ".join(param["name"] for param in doc.parameters if param.get("name")),
-                ]
-            ).lower()
-            haystack_tokens = tokenize(haystack)
-
-            overlap = len(query_tokens & haystack_tokens)
-            path_bonus = sum(1 for token in query_tokens if token in doc.path.lower())
-            summary_bonus = sum(1 for token in query_tokens if token in doc.summary.lower())
+            overlap = len(query_tokens & doc.searchable_tokens)
+            path_bonus = sum(1 for token in query_tokens if token in doc.path_lower)
+            summary_bonus = sum(1 for token in query_tokens if token in doc.summary_lower)
             score = overlap * 3 + path_bonus * 2 + summary_bonus
 
-            if query.lower() in haystack:
+            if cache_key[0] in doc.searchable_text:
                 score += 5
 
             for keyword, prefix in domain_prefix_boosts.items():
@@ -421,6 +431,7 @@ class OpenAPICatalog:
                     "operation_id": doc.operation_id,
                 }
             )
+        self.search_cache[cache_key] = results
         return results
 
     def details(self, method: str, path: str) -> dict[str, Any]:
@@ -450,15 +461,22 @@ class TripletexClient:
     def __init__(self, base_url: str, session_token: str, timeout: int = TRIPLETEX_TIMEOUT_SECONDS):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
-        self.session = requests.Session()
-        self.session.auth = ("0", session_token)
-        self.session.headers.update({"Accept": "application/json"})
+        self.session = httpx.AsyncClient(
+            base_url=self.base_url,
+            auth=httpx.BasicAuth("0", session_token),
+            headers={"Accept": "application/json"},
+            timeout=httpx.Timeout(timeout=timeout, connect=min(5.0, float(timeout))),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
         self.get_cache: dict[str, Any] = {}
         self.successful_write_fingerprints: set[str] = set()
         self.failed_write_fingerprints: set[str] = set()
         self.read_calls = 0
         self.write_calls = 0
         self.write_errors = 0
+
+    async def aclose(self) -> None:
+        await self.session.aclose()
 
     def _fingerprint(self, method: str, path: str, params: dict[str, Any] | None, json_body: Any) -> str:
         return json.dumps(
@@ -472,7 +490,7 @@ class TripletexClient:
             sort_keys=True,
         )
 
-    def request(
+    async def request(
         self,
         method: str,
         path: str,
@@ -499,28 +517,35 @@ class TripletexClient:
                     "reason": "Duplicate failed write avoided to prevent another penalty.",
                 }
 
-        response: requests.Response | None = None
+        response: httpx.Response | None = None
         last_error: Exception | None = None
         max_attempts = 3 if method == "GET" else 1
 
         for attempt in range(1, max_attempts + 1):
             try:
-                response = self.session.request(
+                response = await self.session.request(
                     method=method,
-                    url=f"{self.base_url}{clean_path}",
+                    url=clean_path,
                     params=params,
                     json=json_body,
-                    timeout=self.timeout,
                 )
-            except requests.RequestException as exc:
+            except asyncio.CancelledError:
+                raise
+            except httpx.TimeoutException as exc:
                 last_error = exc
                 if method == "GET" and attempt < max_attempts:
-                    time.sleep(0.4 * attempt)
+                    await asyncio.sleep(0.2 * attempt)
+                    continue
+                raise HTTPException(status_code=504, detail=f"Tripletex request timed out: {exc}") from exc
+            except httpx.RequestError as exc:
+                last_error = exc
+                if method == "GET" and attempt < max_attempts:
+                    await asyncio.sleep(0.2 * attempt)
                     continue
                 raise HTTPException(status_code=502, detail=f"Tripletex request failed: {exc}") from exc
 
             if method == "GET" and response.status_code in {429, 500, 502, 503, 504} and attempt < max_attempts:
-                time.sleep(0.4 * attempt)
+                await asyncio.sleep(0.2 * attempt)
                 continue
             break
 
@@ -554,8 +579,8 @@ class TripletexClient:
 
         return payload
 
-    def verify_connection(self) -> dict[str, Any]:
-        payload = self.request(
+    async def verify_connection(self) -> dict[str, Any]:
+        payload = await self.request(
             "GET",
             "/employee",
             params={"count": 1, "fields": "id,firstName,lastName,email"},
@@ -572,7 +597,7 @@ class TripletexClient:
         }
 
     @staticmethod
-    def _extract_error(response: requests.Response) -> str:
+    def _extract_error(response: httpx.Response) -> str:
         try:
             payload = response.json()
         except ValueError:
@@ -777,6 +802,7 @@ async def execute_accounting_task(
 ) -> str:
     catalog = load_catalog()
     gemini_client = build_gemini_client()
+    summary = ""
 
     logger.info(
         "Received task. run_id=%s prompt=%s attachments=%s",
@@ -787,23 +813,23 @@ async def execute_accounting_task(
 
     task_prompt = build_task_prompt(request, attachments, catalog)
 
-    def search_api(query: str, method: str = "", limit: int = 8) -> dict[str, Any]:
+    async def search_api(query: str, method: str = "", limit: int = 8) -> dict[str, Any]:
         """Search the local Tripletex OpenAPI catalog for relevant endpoints before making uncertain API calls."""
         safe_limit = max(1, min(limit, 15))
         matches = catalog.search(query=query, method=method or None, limit=safe_limit)
         return {"matches": matches}
 
-    def get_api_details(method: str, path: str) -> dict[str, Any]:
+    async def get_api_details(method: str, path: str) -> dict[str, Any]:
         """Get detailed local documentation for a specific endpoint, including parameters and request body schema."""
         return catalog.details(method=method, path=path)
 
-    def tripletex_get(path: str, params_json: str = "{}") -> dict[str, Any]:
+    async def tripletex_get(path: str, params_json: str = "{}") -> dict[str, Any]:
         """Execute a read-only GET request against the provided Tripletex proxy. params_json must be a JSON object string."""
         params = parse_json_string(params_json, default={})
-        payload = client.request("GET", path, params=params)
+        payload = await client.request("GET", path, params=params)
         return {"stats": client.stats(), "result": prune_for_model(payload)}
 
-    def tripletex_write(method: str, path: str, params_json: str = "{}", body_json: str = "{}") -> dict[str, Any]:
+    async def tripletex_write(method: str, path: str, params_json: str = "{}", body_json: str = "{}") -> dict[str, Any]:
         """Execute a write request against Tripletex. Use only for POST, PUT, PATCH, or DELETE once you are confident."""
         method_upper = method.upper()
         if method_upper not in {"POST", "PUT", "PATCH", "DELETE"}:
@@ -814,18 +840,18 @@ async def execute_accounting_task(
         if method_upper == "DELETE" and body == {}:
             body = None
 
-        payload = client.request(method_upper, path, params=params, json_body=body)
+        payload = await client.request(method_upper, path, params=params, json_body=body)
         return {"stats": client.stats(), "result": prune_for_model(payload)}
 
     tool_names = ["search_api", "get_api_details", "tripletex_get", "tripletex_write"]
-    tool_map: dict[str, Callable[..., dict[str, Any]]] = {
+    tool_map: dict[str, Callable[..., Any]] = {
         "search_api": search_api,
         "get_api_details": get_api_details,
         "tripletex_get": tripletex_get,
         "tripletex_write": tripletex_write,
     }
 
-    def _run_model(prompt_text: str, allowed_tools: list[Any], allowed_tool_names: list[str], remote_call_budget: int) -> str:
+    async def _run_model(prompt_text: str, allowed_tools: list[Any], allowed_tool_names: list[str], remote_call_budget: int) -> str:
         config = types.GenerateContentConfig(
             systemInstruction=build_system_instruction(),
             temperature=0.0,
@@ -846,7 +872,7 @@ async def execute_accounting_task(
         last_text = ""
 
         while remote_calls_used < remote_call_budget:
-            response = gemini_client.models.generate_content(
+            response = await gemini_client.aio.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=history,
                 config=config,
@@ -898,7 +924,9 @@ async def execute_accounting_task(
 
                 tool = tool_map[function_call.name]
                 try:
-                    result = tool(**(function_call.args or {}))
+                    result = await tool(**(function_call.args or {}))
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     result = {
                         "error": str(exc),
@@ -938,33 +966,31 @@ async def execute_accounting_task(
 
         return last_text
 
-    summary = await asyncio.wait_for(
-        asyncio.to_thread(
-            _run_model,
-            task_prompt,
-            [search_api, get_api_details, tripletex_get, tripletex_write],
-            tool_names,
-            PRIMARY_TOOL_CALL_BUDGET,
-        ),
-        timeout=REQUEST_TIME_BUDGET_SECONDS,
-    )
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + REQUEST_TIME_BUDGET_SECONDS
 
-    if client.write_calls == 0:
-        logger.warning("Primary pass completed without writes. Starting forced action pass.")
-        remaining_budget = max(30, REQUEST_TIME_BUDGET_SECONDS // 3)
-        action_prompt = build_action_prompt(request, attachments, catalog)
-        forced_summary = await asyncio.wait_for(
-            asyncio.to_thread(
-                _run_model,
-                action_prompt,
-                [get_api_details, tripletex_get, tripletex_write],
-                ["get_api_details", "tripletex_get", "tripletex_write"],
-                ACTION_TOOL_CALL_BUDGET,
-            ),
-            timeout=remaining_budget,
-        )
-        if forced_summary:
-            summary = forced_summary
+    try:
+        async with asyncio.timeout(REQUEST_TIME_BUDGET_SECONDS):
+            summary = await _run_model(
+                task_prompt,
+                [search_api, get_api_details, tripletex_get, tripletex_write],
+                tool_names,
+                PRIMARY_TOOL_CALL_BUDGET,
+            )
+
+            if client.write_calls == 0 and deadline - loop.time() > 5:
+                logger.warning("Primary pass completed without writes. Starting forced action pass.")
+                action_prompt = build_action_prompt(request, attachments, catalog)
+                forced_summary = await _run_model(
+                    action_prompt,
+                    [get_api_details, tripletex_get, tripletex_write],
+                    ["get_api_details", "tripletex_get", "tripletex_write"],
+                    ACTION_TOOL_CALL_BUDGET,
+                )
+                if forced_summary:
+                    summary = forced_summary
+    finally:
+        await gemini_client.aio.aclose()
 
     logger.info("Agent summary: %s", summary)
     logger.info("Tripletex call stats: %s", client.stats())
@@ -989,9 +1015,15 @@ async def solve(
     failure_reason: str | None = None
     try:
         summary = await execute_accounting_task(run_id, request_body, tripletex_client, attachments)
+    except TimeoutError:
+        failure_reason = (
+            f"The task exceeded the overall time budget of {REQUEST_TIME_BUDGET_SECONDS} seconds and was cancelled."
+        )
     except Exception:  # noqa: BLE001
         failure_reason = traceback.format_exc(limit=3)
         logger.exception("Unhandled execution error")
+    finally:
+        await tripletex_client.aclose()
 
     success = tripletex_client.write_calls > 0 and tripletex_client.write_errors == 0
     if not success and not failure_reason:

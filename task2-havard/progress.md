@@ -17,3 +17,6 @@
 - Added direct task-family endpoint hints and a second forced-action Gemini pass so the agent is less likely to spend all tool calls on reads without making the required write.
 - Added terminal task-run reporting that prints the task prompt, whether the run appears to have succeeded, Tripletex call counts, and the concrete failure reason when it does not.
 - Replaced Gemini automatic function calling with a manual tool loop so the agent can detect read-only stalls, inject corrective steering, and push the model toward the required write when it starts circling.
+- Replaced the blocking `requests` and `asyncio.to_thread` execution path with native async `httpx` and Gemini async calls so the global request timeout can cancel in-flight model/API work instead of leaving calls running after shutdown.
+- Optimized local OpenAPI search by precomputing searchable endpoint text/tokens and caching search results, which reduces repeated spec-scanning overhead across model tool calls.
+- Updated runtime dependencies to use `httpx` instead of `requests` to match the new cancellable async HTTP path.
