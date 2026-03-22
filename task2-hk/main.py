@@ -424,7 +424,8 @@ def task_verdict(stats: dict) -> tuple:
 
 
 def run_agent(prompt: str, files: list, base_url: str, token: str, ctx: dict, rid: str = "", task_type: str = ""):
-    client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
+    # client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
+    client = genai.Client(api_key="AIzaSyBI2N7eEJcn9-TUaizlJJMOuJtQIInOJHs")
     start = time.time()
     today = date.today().isoformat()
 
