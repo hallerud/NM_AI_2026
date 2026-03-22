@@ -71,11 +71,70 @@ def _find_nullish_paths(value, prefix=""):
     return paths
 
 
+def _decode_text_attachment(data: bytes) -> str | None:
+    for encoding in ("utf-8", "utf-8-sig", "iso-8859-1", "cp1252"):
+        try:
+            return data.decode(encoding)
+        except Exception:
+            continue
+    return None
+
+
 def _split_endpoint_and_query(endpoint: str) -> tuple[str, dict]:
     path, sep, query = endpoint.partition("?")
     if not sep or not query:
         return endpoint, {}
     return path, dict(parse_qsl(query, keep_blank_values=True))
+
+
+def _apply_safe_default_params(method: str, endpoint: str, params: dict) -> dict:
+    """Auto-fill harmless required filters for free read endpoints."""
+    params = dict(params or {})
+    ep = endpoint.rstrip("/")
+    if method.upper() != "GET":
+        return params
+
+    if ep.endswith("/ledger/voucher"):
+        params.setdefault("dateFrom", "2020-01-01")
+        params.setdefault("dateTo", "2030-12-31")
+    elif ep.endswith("/invoice"):
+        params.setdefault("invoiceDateFrom", "2020-01-01")
+        params.setdefault("invoiceDateTo", "2030-12-31")
+    elif ep.endswith("/order"):
+        params.setdefault("orderDateFrom", "2020-01-01")
+        params.setdefault("orderDateTo", "2030-12-31")
+    return params
+
+
+def _missing_body_feedback(endpoint: str) -> dict:
+    ep = endpoint.rstrip("/")
+    guidance = {
+        "/ledger/voucher": {
+            "message": "POST /ledger/voucher requires a JSON payload in body with date, description, and balanced postings. Do not leave body empty.",
+            "example": {
+                "method": "POST",
+                "endpoint": "/ledger/voucher",
+                "body": {
+                    "date": "2026-03-22",
+                    "description": "Bank reconciliation or supplier invoice",
+                    "postings": [
+                        {"row": 1, "date": "2026-03-22", "account": {"id": 6340}, "amountGross": 39800, "amountGrossCurrency": 39800},
+                        {"row": 2, "date": "2026-03-22", "account": {"id": 2710}, "amountGross": 9950, "amountGrossCurrency": 9950},
+                        {"row": 3, "date": "2026-03-22", "account": {"id": 1920}, "amountGross": -49750, "amountGrossCurrency": -49750},
+                    ],
+                },
+            },
+        },
+        "/order": {
+            "message": "POST /order requires a JSON payload in body with customer, orderDate, deliveryDate, VAT mode, and all orderLines.",
+        },
+        "/travelExpense": {
+            "message": "POST /travelExpense requires a JSON payload in body. Do not leave body empty.",
+        },
+    }
+    return guidance.get(ep, {
+        "message": f"{ep} requires a JSON payload in the tool body. Do not put the payload in endpoint or params.",
+    })
 
 def tx(method: str, base_url: str, token: str, endpoint: str,
        params: dict = None, body: dict = None, bank_account: str = None) -> dict:
@@ -86,6 +145,7 @@ def tx(method: str, base_url: str, token: str, endpoint: str,
 
     # ── Local pre-flight checks — return early without hitting the API ──────────
     params = _prune_nullish({**endpoint_query, **(params or {})})
+    params = _apply_safe_default_params(m, endpoint_path, params)
     body = _prune_nullish(body)
 
     def _missing_date(param_name: str) -> bool:
@@ -230,12 +290,15 @@ def prefetch(base_url: str, token: str) -> dict:
 
     ctx["vat_types"]       = [{"id": v["id"], "number": v.get("number"), "name": v.get("name"), "pct": v.get("percentage")}
                                for v in vals("/ledger/vatType", {"fields": "id,number,name,percentage", "count": 100})[:20]]
-    ctx["payment_types"]   = vals("/invoice/paymentType",  {"fields": "id,description"})
+    ctx["payment_types"]   = vals("/invoice/paymentType",  {"fields": "id,description,displayName,currencyCode,isInactive"})
     ctx["customers"]       = vals("/customer",             {"fields": "id,name,organizationNumber,email", "count": 50})
+    ctx["suppliers"]       = vals("/supplier",             {"fields": "id,name,organizationNumber,email", "count": 50})
     ctx["employees"]       = vals("/employee",             {"fields": "id,firstName,lastName,email", "count": 50})
     ctx["products"]        = vals("/product",              {"fields": "id,name,priceExcludingVatCurrency", "count": 50})
     ctx["invoices"]        = vals("/invoice",              {"fields": "id,invoiceNumber,customer,amount,amountOutstanding", "count": 30, **default_invoice_date_span})
     ctx["orders"]          = vals("/order",                {"fields": "id,number,customer,orderDate", "count": 30, **default_order_date_span})
+    ctx["vouchers"]        = vals("/ledger/voucher",       {"fields": "id,number,date,description", "count": 30, "dateFrom": "2020-01-01", "dateTo": "2030-12-31"})
+    ctx["currencies"]      = vals("/currency",             {"fields": "id,code,displayName", "count": 50})
     ctx["departments"]     = vals("/department",           {"fields": "id,name,departmentNumber", "count": 50})
     ctx["projects"]        = vals("/project",              {"fields": "id,name,number,customer,projectManager", "count": 50})
     ctx["travel_expenses"] = vals("/travelExpense",        {"fields": "id,title,employee,status", "count": 30})
@@ -266,10 +329,23 @@ TOOLS = [types.Tool(function_declarations=[
         parameters=types.Schema(
             type=types.Type.OBJECT,
             properties={
-                "method":   types.Schema(type=types.Type.STRING, enum=["GET", "POST", "PUT", "DELETE"]),
-                "endpoint": types.Schema(type=types.Type.STRING),
-                "params":   types.Schema(type=types.Type.OBJECT),
-                "body":     types.Schema(type=types.Type.OBJECT),
+                "method":   types.Schema(
+                    type=types.Type.STRING,
+                    enum=["GET", "POST", "PUT", "DELETE"],
+                    description="HTTP method. Use PUT for Tripletex updates/action endpoints; do not use PATCH."
+                ),
+                "endpoint": types.Schema(
+                    type=types.Type.STRING,
+                    description="API path starting with /. Prefer the path only, without query string. Example: /invoice/123/:payment"
+                ),
+                "params":   types.Schema(
+                    type=types.Type.OBJECT,
+                    description="Query parameters only. Use this for paymentDate, paymentTypeId, dateFrom/dateTo, sendType, invoiceDate, etc."
+                ),
+                "body":     types.Schema(
+                    type=types.Type.OBJECT,
+                    description="JSON body for POST/PUT to normal endpoints. Omit body for action endpoints like /:payment, /:send, /:invoice, /:createCreditNote unless explicitly required."
+                ),
             },
             required=["method", "endpoint"],
         ),
@@ -307,6 +383,7 @@ Never send null/None/"null"/empty-string values to the API. If a field is option
 ## API
 - Single entity: response.data.value | Lists: response.data.values | POST returns: response.data.value.id
 - All dates: YYYY-MM-DD | Discover fields: GET <endpoint>?fields=*
+- For tool calls: POST/PUT to normal endpoints MUST send the JSON payload in body. Query parameters belong in params.
 
 ## PUT — UNIVERSAL RULE
 ANY PUT to an existing entity:
@@ -401,6 +478,11 @@ Supplier invoice example (net 39800, 25% VAT=9950, total 49750):
   {{"row":3,"date":"...","account":{{"id":<1920>}},"amountGross":-49750,"amountGrossCurrency":-49750}}
 
 Bank reconciliation: customer payments → PUT /invoice/:payment. Supplier without invoice → expense vs 1920.
+For bank reconciliation tasks with CSV/bank statement attachments:
+- Read the attachment carefully before any write call.
+- Match incoming customer payments to open invoices first.
+- For supplier payments without an invoice in Tripletex, create a balanced voucher.
+- If you need GET /ledger/voucher and do not know the date range yet, use dateFrom=2020-01-01 and dateTo=2030-12-31.
 Skattetrekk entries: credit 2600, debit 1920.
 Reverse a voucher: PUT /ledger/voucher/{{id}}/:reverse?date=YYYY-MM-DD — date is REQUIRED query param, NO body
 
@@ -480,9 +562,9 @@ def detect_task_type(prompt: str) -> str:
     checks = [
         (["reiseregning", "travel expense", "note de frais", "gastos de viaje", "reisekost"], "Travel Expense"),
         (["kreditnota", "credit note", "gutschrift", "nota de crédito", "note de crédit"],     "Credit Note"),
+        (["bankavst", "bank reconciliation", "bankutskrift", "avstem", "bankabstimmung", "conciliación bancaria"], "Bank Reconciliation"),
         (["leverandørfaktura", "leverandorfaktura", "supplier invoice", "lieferantenrechnung", "factura de proveedor", "facture fournisseur"], "Supplier Invoice"),
         (["avskrivning", "depreciation", "abschreibung", "amortissement", "depreciación"],     "Depreciation"),
-        (["bankavst", "bank reconciliation", "bankabstimmung", "conciliación bancaria"],       "Bank Reconciliation"),
         (["faktura", "invoice", "rechnung", "factura", "facture"],                             "Invoice"),
         (["ansatt", "tilsett", "employee", "empleado", "mitarbeiter", "employé", "ansette"],   "Employee"),
         (["prosjekt", "project", "proyecto", "projet", "projekt"],                             "Project"),
@@ -522,6 +604,7 @@ def task_verdict(stats: dict) -> tuple:
 
 
 def run_agent(prompt: str, files: list, base_url: str, token: str, ctx: dict, rid: str = "", task_type: str = ""):
+    # api_key = os.environ.get("GOOGLE_API_KEY")
     api_key = "AIzaSyBI2N7eEJcn9-TUaizlJJMOuJtQIInOJHs"
     if not api_key:
         raise RuntimeError("GOOGLE_API_KEY is not set")
@@ -537,10 +620,9 @@ def run_agent(prompt: str, files: list, base_url: str, token: str, ctx: dict, ri
         if mime.startswith("image/") or mime == "application/pdf":
             parts.append(types.Part(inline_data=types.Blob(mime_type=mime, data=data)))
         else:
-            try:
-                parts.append(types.Part(text=f"File: {f.get('filename', '')}\n{data.decode()}"))
-            except Exception:
-                pass
+            text = _decode_text_attachment(data)
+            if text is not None:
+                parts.append(types.Part(text=f"File: {f.get('filename', '')}\n{text}"))
 
     # Context summary
     def fmt_list(items, fn):
@@ -559,10 +641,13 @@ def run_agent(prompt: str, files: list, base_url: str, token: str, ctx: dict, ri
 {fmt_list(ctx.get('vat_types', []), lambda v: f"ID {v['id']}: #{v['number']} {v['name']} ({v['pct']}%)")}
 
 ### Payment Types
-{fmt_list(ctx.get('payment_types', []), lambda p: f"ID {p['id']}: {p.get('description')}")}
+{fmt_list(ctx.get('payment_types', []), lambda p: f"ID {p['id']}: {p.get('description') or p.get('displayName')} currency={p.get('currencyCode')} inactive={p.get('isInactive')}")}
 
 ### Customers
 {fmt_list(ctx.get('customers', []), lambda c: f"ID {c['id']}: {c.get('name')} (org: {c.get('organizationNumber')}, email: {c.get('email')})")}
+
+### Suppliers
+{fmt_list(ctx.get('suppliers', []), lambda s: f"ID {s['id']}: {s.get('name')} (org: {s.get('organizationNumber')}, email: {s.get('email')})")}
 
 ### Employees
 {fmt_list(ctx.get('employees', []), lambda e: f"ID {e['id']}: {e.get('firstName')} {e.get('lastName')} ({e.get('email')})")}
@@ -575,6 +660,12 @@ def run_agent(prompt: str, files: list, base_url: str, token: str, ctx: dict, ri
 
 ### Orders
 {fmt_list(ctx.get('orders', []), lambda o: f"ID {o['id']}: #{o.get('number')} customer={o.get('customer', {}).get('name') if isinstance(o.get('customer'), dict) else '?'}")}
+
+### Vouchers
+{fmt_list(ctx.get('vouchers', []), lambda v: f"ID {v['id']}: #{v.get('number')} {v.get('date')} {v.get('description')}")}
+
+### Currencies
+{fmt_list(ctx.get('currencies', []), lambda c: f"ID {c['id']}: {c.get('code')} {c.get('displayName')}")}
 
 ### Departments
 {fmt_list(ctx.get('departments', []), lambda d: f"ID {d['id']}: {d.get('name')} (#{d.get('departmentNumber')})")}
@@ -615,6 +706,7 @@ Plan your steps, then execute efficiently."""
     consecutive_404s = 0
     consecutive_write_errors = 0
     fatal_stop = False
+    read_cache = {}
 
     for i in range(15):
         elapsed = time.time() - start
@@ -635,7 +727,7 @@ Plan your steps, then execute efficiently."""
                     tools=TOOLS,
                     tool_config=types.ToolConfig(
                         function_calling_config=types.FunctionCallingConfig(
-                            mode="ANY",
+                            mode="AUTO",
                             allowed_function_names=["tripletex_api"],
                         )
                     ),
@@ -678,6 +770,7 @@ Plan your steps, then execute efficiently."""
             endpoint = inp.get("endpoint", "")
             endpoint, endpoint_query = _split_endpoint_and_query(endpoint)
             params   = _prune_nullish({**endpoint_query, **(_to_dict(inp.get("params")) or {})})
+            params   = _apply_safe_default_params(method, endpoint, params)
             body     = _prune_nullish(_to_dict(inp.get("body")))
 
             is_write = method.upper() in WRITE_METHODS
@@ -697,19 +790,58 @@ Plan your steps, then execute efficiently."""
                 is_action = endpoint.split("?")[0].split("/")[-1].startswith(":")
                 if not is_action:
                     print(f"{tag}  🛑 Blocked {method} {endpoint} — body is null/empty (would 422)")
-                    result = {"status_code": 0, "error": f"Blocked: {method} {endpoint} requires a body but none was provided. Add required fields to the body."}
+                    feedback = _missing_body_feedback(endpoint)
+                    result = {
+                        "status_code": 422,
+                        "data": {
+                            "message": "Validation failed",
+                            "developerMessage": feedback["message"],
+                            "validationMessages": [{"field": "body", "message": "Kan ikke være null. Put the JSON payload in body."}],
+                            "example": feedback.get("example"),
+                        },
+                    }
                     stats["errors_4xx"] += 1
+                    stats["calls"].append({
+                        "method": method,
+                        "endpoint": endpoint,
+                        "status": 422,
+                        "error": "Validation failed",
+                        "is_write": is_write,
+                    })
+                    if is_write:
+                        consecutive_write_errors += 1
                     tool_response_parts.append(types.Part(
                         function_response=types.FunctionResponse(
                             name=fc.name,
                             response={"result": json.dumps(result)},
                         )
                     ))
+                    if consecutive_write_errors >= 3:
+                        stats["stop_reason"] = "fatal: 3 consecutive local write validation failures"
+                        print(f"{tag}  🛑 Fatal: 3 consecutive blocked writes — stopping to avoid a retry loop.")
+                        fatal_stop = True
+                        break
                     continue
 
-            result = tx(method, base_url, token, endpoint, params=params, body=body,
-                        bank_account=ctx.get("bank_account"))
-            status = result.get("status_code", 0)
+            cache_key = None
+            if method.upper() == "GET":
+                cache_key = json.dumps({"endpoint": endpoint, "params": params}, ensure_ascii=False, sort_keys=True, default=str)
+                cached = read_cache.get(cache_key)
+                if cached is not None:
+                    result = cached
+                    status = result.get("status_code", 0)
+                    print(f"{tag}     ♻️ cache hit [{status}]")
+                else:
+                    result = tx(method, base_url, token, endpoint, params=params, body=body,
+                                bank_account=ctx.get("bank_account"))
+                    read_cache[cache_key] = result
+                    status = result.get("status_code", 0)
+            else:
+                result = tx(method, base_url, token, endpoint, params=params, body=body,
+                            bank_account=ctx.get("bank_account"))
+                status = result.get("status_code", 0)
+                if status < 400:
+                    read_cache.clear()
 
             if is_write:
                 stats["write_calls"] += 1
