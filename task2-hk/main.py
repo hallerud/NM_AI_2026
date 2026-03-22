@@ -16,6 +16,20 @@ from google.genai import types
 
 app = FastAPI()
 
+DEFAULT_DATE_FROM = "2020-01-01"
+DEFAULT_DATE_TO = "2030-12-31"
+DEFAULT_INVOICE_QUERY = {"invoiceDateFrom": DEFAULT_DATE_FROM, "invoiceDateTo": DEFAULT_DATE_TO}
+DEFAULT_ORDER_QUERY = {"orderDateFrom": DEFAULT_DATE_FROM, "orderDateTo": DEFAULT_DATE_TO}
+DEFAULT_VOUCHER_QUERY = {"dateFrom": DEFAULT_DATE_FROM, "dateTo": DEFAULT_DATE_TO}
+
+ACCOUNTING_HEAVY_TASKS = {"Bank Reconciliation", "Supplier Invoice", "Voucher", "Department", "Depreciation"}
+INVOICE_TASKS = {"Invoice", "Credit Note", "Bank Reconciliation"}
+SUPPLIER_TASKS = {"Supplier", "Supplier Invoice", "Voucher", "Bank Reconciliation", "Department"}
+TRAVEL_TASKS = {"Travel Expense"}
+PROJECT_TASKS = {"Project", "Timesheet"}
+SALARY_TASKS = {"Salary/Payroll"}
+ASSET_TASKS = {"Depreciation"}
+
 
 # ── Tripletex API helper ──────────────────────────────────────────────────────
 
@@ -95,14 +109,14 @@ def _apply_safe_default_params(method: str, endpoint: str, params: dict) -> dict
         return params
 
     if ep.endswith("/ledger/voucher"):
-        params.setdefault("dateFrom", "2020-01-01")
-        params.setdefault("dateTo", "2030-12-31")
+        params.setdefault("dateFrom", DEFAULT_DATE_FROM)
+        params.setdefault("dateTo", DEFAULT_DATE_TO)
     elif ep.endswith("/invoice"):
-        params.setdefault("invoiceDateFrom", "2020-01-01")
-        params.setdefault("invoiceDateTo", "2030-12-31")
+        params.setdefault("invoiceDateFrom", DEFAULT_DATE_FROM)
+        params.setdefault("invoiceDateTo", DEFAULT_DATE_TO)
     elif ep.endswith("/order"):
-        params.setdefault("orderDateFrom", "2020-01-01")
-        params.setdefault("orderDateTo", "2030-12-31")
+        params.setdefault("orderDateFrom", DEFAULT_DATE_FROM)
+        params.setdefault("orderDateTo", DEFAULT_DATE_TO)
     return params
 
 
@@ -118,9 +132,9 @@ def _missing_body_feedback(endpoint: str) -> dict:
                     "date": "2026-03-22",
                     "description": "Bank reconciliation or supplier invoice",
                     "postings": [
-                        {"row": 1, "date": "2026-03-22", "account": {"id": 6340}, "amountGross": 39800, "amountGrossCurrency": 39800},
-                        {"row": 2, "date": "2026-03-22", "account": {"id": 2710}, "amountGross": 9950, "amountGrossCurrency": 9950},
-                        {"row": 3, "date": "2026-03-22", "account": {"id": 1920}, "amountGross": -49750, "amountGrossCurrency": -49750},
+                        {"row": 1, "date": "2026-03-22", "account": {"id": "<ID of account #6340 from ledger_accounts>"}, "amountGross": 39800, "amountGrossCurrency": 39800},
+                        {"row": 2, "date": "2026-03-22", "account": {"id": "<ID of account #2710 from ledger_accounts>"}, "amountGross": 9950, "amountGrossCurrency": 9950},
+                        {"row": 3, "date": "2026-03-22", "account": {"id": "<ID of account #1920 from ledger_accounts>"}, "amountGross": -49750, "amountGrossCurrency": -49750},
                     ],
                 },
             },
@@ -254,10 +268,9 @@ def tx(method: str, base_url: str, token: str, endpoint: str,
 
 # ── Pre-fetch context ─────────────────────────────────────────────────────────
 
-def prefetch(base_url: str, token: str) -> dict:
+def prefetch(base_url: str, token: str, task_type: str = "Unknown") -> dict:
     auth = ("0", token)
-    default_invoice_date_span = {"invoiceDateFrom": "2020-01-01", "invoiceDateTo": "2030-12-31"}
-    default_order_date_span = {"orderDateFrom": "2020-01-01", "orderDateTo": "2030-12-31"}
+    include_all = task_type == "Unknown"
 
     def get(path, params=None):
         try:
@@ -290,26 +303,118 @@ def prefetch(base_url: str, token: str) -> dict:
 
     ctx["vat_types"]       = [{"id": v["id"], "number": v.get("number"), "name": v.get("name"), "pct": v.get("percentage")}
                                for v in vals("/ledger/vatType", {"fields": "id,number,name,percentage", "count": 100})[:20]]
-    ctx["payment_types"]   = vals("/invoice/paymentType",  {"fields": "id,description,displayName,currencyCode,isInactive"})
     ctx["customers"]       = vals("/customer",             {"fields": "id,name,organizationNumber,email", "count": 50})
-    ctx["suppliers"]       = vals("/supplier",             {"fields": "id,name,organizationNumber,email", "count": 50})
     ctx["employees"]       = vals("/employee",             {"fields": "id,firstName,lastName,email", "count": 50})
-    ctx["products"]        = vals("/product",              {"fields": "id,name,priceExcludingVatCurrency", "count": 50})
-    ctx["invoices"]        = vals("/invoice",              {"fields": "id,invoiceNumber,customer,amount,amountOutstanding", "count": 30, **default_invoice_date_span})
-    ctx["orders"]          = vals("/order",                {"fields": "id,number,customer,orderDate", "count": 30, **default_order_date_span})
-    ctx["vouchers"]        = vals("/ledger/voucher",       {"fields": "id,number,date,description", "count": 30, "dateFrom": "2020-01-01", "dateTo": "2030-12-31"})
-    ctx["currencies"]      = vals("/currency",             {"fields": "id,code,displayName", "count": 50})
     ctx["departments"]     = vals("/department",           {"fields": "id,name,departmentNumber", "count": 50})
-    ctx["projects"]        = vals("/project",              {"fields": "id,name,number,customer,projectManager", "count": 50})
-    ctx["travel_expenses"] = vals("/travelExpense",        {"fields": "id,title,employee,status", "count": 30})
-    ctx["assets"]          = vals("/asset",                {"fields": "id,name,accountNumber,acquisitionCost,depreciationRate", "count": 50})
-
-    # Fetch all ledger accounts at once — avoids one-by-one lookups during agent loop
-    ctx["ledger_accounts"] = vals("/ledger/account", {"fields": "id,number,name,isInactive", "count": 1000})
-
-    ctx["salary_types"]    = vals("/salary/type",    {"fields": "id,number,name", "count": 100})
+    ctx["payment_types"]   = vals("/invoice/paymentType",  {"fields": "id,description,displayName,currencyCode,isInactive"}) if include_all or task_type in INVOICE_TASKS or task_type in TRAVEL_TASKS or task_type in ACCOUNTING_HEAVY_TASKS else []
+    ctx["suppliers"]       = vals("/supplier",             {"fields": "id,name,organizationNumber,email", "count": 50}) if include_all or task_type in SUPPLIER_TASKS else []
+    ctx["products"]        = vals("/product",              {"fields": "id,name,priceExcludingVatCurrency", "count": 50}) if include_all or task_type in {"Invoice", "Product"} else []
+    ctx["invoices"]        = vals("/invoice",              {"fields": "id,invoiceNumber,customer,amount,amountOutstanding", "count": 30, **DEFAULT_INVOICE_QUERY}) if include_all or task_type in INVOICE_TASKS else []
+    ctx["orders"]          = vals("/order",                {"fields": "id,number,customer,orderDate", "count": 30, **DEFAULT_ORDER_QUERY}) if include_all or task_type in INVOICE_TASKS else []
+    ctx["vouchers"]        = vals("/ledger/voucher",       {"fields": "id,number,date,description", "count": 30, **DEFAULT_VOUCHER_QUERY}) if include_all or task_type in ACCOUNTING_HEAVY_TASKS else []
+    ctx["currencies"]      = vals("/currency",             {"fields": "id,code,displayName", "count": 50}) if include_all or task_type in ACCOUNTING_HEAVY_TASKS or task_type in INVOICE_TASKS else []
+    ctx["projects"]        = vals("/project",              {"fields": "id,name,number,customer,projectManager", "count": 50}) if include_all or task_type in PROJECT_TASKS else []
+    ctx["travel_expenses"] = vals("/travelExpense",        {"fields": "id,title,employee,status", "count": 30}) if include_all or task_type in TRAVEL_TASKS else []
+    ctx["assets"]          = vals("/asset",                {"fields": "id,name,accountNumber,acquisitionCost,depreciationRate", "count": 50}) if include_all or task_type in ASSET_TASKS else []
+    ctx["ledger_accounts"] = vals("/ledger/account", {"fields": "id,number,name,isInactive", "count": 1000}) if include_all or task_type in ACCOUNTING_HEAVY_TASKS else []
+    ctx["salary_types"]    = vals("/salary/type",    {"fields": "id,number,name", "count": 100}) if include_all or task_type in SALARY_TASKS else []
 
     return ctx
+
+
+def _render_section(title: str, items: list, formatter) -> str:
+    if not items:
+        return f"### {title}\n  (none)"
+    return f"### {title}\n" + "\n".join(f"  {formatter(item)}" for item in items)
+
+
+def _build_context_text(prompt: str, ctx: dict, today: str, task_type: str) -> str:
+    sections = [
+        "## Task",
+        prompt,
+        "",
+        "## Session",
+        f"- Employee ID: {ctx.get('employee_id')} ({ctx.get('employee_name')})",
+        f"- Company: {ctx.get('company_id')} — {ctx.get('company_name') or 'unknown'}",
+        f"- Bank account: {ctx.get('bank_account') or 'not set'}",
+        f"- Today: {today}",
+        "",
+        _render_section("VAT Types", ctx.get("vat_types", []), lambda v: f"ID {v['id']}: #{v['number']} {v['name']} ({v['pct']}%)"),
+        "",
+        _render_section("Customers", ctx.get("customers", []), lambda c: f"ID {c['id']}: {c.get('name')} (org: {c.get('organizationNumber')}, email: {c.get('email')})"),
+        "",
+        _render_section("Employees", ctx.get("employees", []), lambda e: f"ID {e['id']}: {e.get('firstName')} {e.get('lastName')} ({e.get('email')})"),
+        "",
+        _render_section("Departments", ctx.get("departments", []), lambda d: f"ID {d['id']}: {d.get('name')} (#{d.get('departmentNumber')})"),
+    ]
+
+    if task_type == "Unknown" or task_type in INVOICE_TASKS or task_type in TRAVEL_TASKS or task_type in ACCOUNTING_HEAVY_TASKS:
+        sections.extend([
+            "",
+            _render_section("Payment Types", ctx.get("payment_types", []), lambda p: f"ID {p['id']}: {p.get('description') or p.get('displayName')} currency={p.get('currencyCode')} inactive={p.get('isInactive')}"),
+        ])
+
+    if task_type == "Unknown" or task_type in {"Invoice", "Product"}:
+        sections.extend([
+            "",
+            _render_section("Products", ctx.get("products", []), lambda p: f"ID {p['id']}: {p.get('name')} (price excl: {p.get('priceExcludingVatCurrency')})"),
+        ])
+
+    if task_type == "Unknown" or task_type in INVOICE_TASKS:
+        sections.extend([
+            "",
+            _render_section("Invoices", ctx.get("invoices", []), lambda i: f"ID {i['id']}: #{i.get('invoiceNumber')} amount={i.get('amount')} outstanding={i.get('amountOutstanding')}"),
+            "",
+            _render_section("Orders", ctx.get("orders", []), lambda o: f"ID {o['id']}: #{o.get('number')} customer={o.get('customer', {}).get('name') if isinstance(o.get('customer'), dict) else '?'}"),
+        ])
+
+    if task_type == "Unknown" or task_type in SUPPLIER_TASKS:
+        sections.extend([
+            "",
+            _render_section("Suppliers", ctx.get("suppliers", []), lambda s: f"ID {s['id']}: {s.get('name')} (org: {s.get('organizationNumber')}, email: {s.get('email')})"),
+        ])
+
+    if task_type == "Unknown" or task_type in PROJECT_TASKS:
+        sections.extend([
+            "",
+            _render_section("Projects", ctx.get("projects", []), lambda p: f"ID {p['id']}: {p.get('name')}"),
+        ])
+
+    if task_type == "Unknown" or task_type in TRAVEL_TASKS:
+        sections.extend([
+            "",
+            _render_section("Travel Expenses", ctx.get("travel_expenses", []), lambda t: f"ID {t['id']}: {t.get('title')} status={t.get('status')}"),
+        ])
+
+    if task_type == "Unknown" or task_type in ASSET_TASKS:
+        sections.extend([
+            "",
+            _render_section("Assets", ctx.get("assets", []), lambda a: f"ID {a['id']}: {a.get('name')} (acq cost: {a.get('acquisitionCost')})"),
+        ])
+
+    if task_type == "Unknown" or task_type in SALARY_TASKS:
+        sections.extend([
+            "",
+            _render_section("Salary Types", ctx.get("salary_types", []), lambda s: f"ID {s['id']}: #{s.get('number')} {s.get('name')}"),
+        ])
+
+    if task_type == "Unknown" or task_type in ACCOUNTING_HEAVY_TASKS:
+        sections.extend([
+            "",
+            _render_section("Vouchers", ctx.get("vouchers", []), lambda v: f"ID {v['id']}: #{v.get('number')} {v.get('date')} {v.get('description')}"),
+            "",
+            f"### Ledger Accounts ({len(ctx.get('ledger_accounts', []))} total)",
+            "\n".join(f"  ID {a['id']}: #{a.get('number')} {a.get('name')}" for a in ctx.get("ledger_accounts", [])) or "  (none)",
+        ])
+
+    if task_type == "Unknown" or task_type in ACCOUNTING_HEAVY_TASKS or task_type in INVOICE_TASKS:
+        sections.extend([
+            "",
+            _render_section("Currencies", ctx.get("currencies", []), lambda c: f"ID {c['id']}: {c.get('code')} {c.get('displayName')}"),
+        ])
+
+    sections.extend(["", "---", "Plan your steps, then execute efficiently."])
+    return "\n".join(sections)
 
 
 # ── Tool ──────────────────────────────────────────────────────────────────────
@@ -322,6 +427,7 @@ TOOLS = [types.Tool(function_declarations=[
             "endpoint must start with / (e.g. /employee, /invoice). "
             "Prefer passing query parameters in params instead of appending them to endpoint, "
             "but if query params are already present in endpoint they will still be used. "
+            "Use Tripletex resource IDs in bodies; for voucher postings account.id must be the ledger account resource ID, not the account number. "
             "Action endpoints use colon syntax: PUT /order/{id}/:invoice, "
             "PUT /invoice/{id}/:send, PUT /invoice/{id}/:payment, "
             "PUT /invoice/{id}/:createCreditNote, PUT /asset/{id}/:depreciate."
@@ -357,194 +463,88 @@ TOOLS = [types.Tool(function_declarations=[
 
 def _build_system_prompt(today: str) -> str:
     return f"""You are an expert Tripletex (Norwegian ERP) accounting agent.
-Complete tasks using the Tripletex v2 REST API. Tasks may be in any of: NO, NN, EN, DE, ES, PT, FR.
+Tasks may be in Norwegian Bokmal, Nynorsk, English, German, Spanish, Portuguese, or French.
 Today: {today}
 
-## SCORING — READ THIS FIRST
-Score = correctness × tier multiplier × efficiency bonus.
-Efficiency bonus (up to 2×) only applies on PERFECT correctness. Hurt by:
-  - Any extra write call (POST/PUT/DELETE) — even successful ones
-  - Any 4xx error on a write call
+## Goal
+Maximize correctness first. Efficiency bonus depends on perfect correctness with few write calls and zero failed write calls.
+GET calls are free. Use them to verify before writing.
 
-GET calls are FREE. Strategy: plan using pre-fetched data → minimum writes → zero retries.
-Never send null/None/"null"/empty-string values to the API. If a field is optional and you do not know it, omit it entirely.
+## Core Rules
+1. Read the task and any attachment carefully before writing anything.
+2. Use pre-fetched context first to avoid duplicates and unnecessary calls.
+3. Never send null/None/"null"/empty strings. Omit unknown optional fields entirely.
+4. For normal POST/PUT requests, the JSON payload MUST go in body. Query parameters MUST go in params.
+5. For action endpoints such as /:invoice, /:payment, /:send, /:createCreditNote, /:reverse: use query params and no body unless explicitly stated.
+6. All dates use YYYY-MM-DD.
+7. organizationNumber is always a STRING.
+8. Bank account numbers must be 11 digits with separators removed.
+9. If you are unsure of resource fields, do a free GET with fields=* before the write call.
+10. If the first call returns 401 or an auth-related 403, stop and report the token problem.
 
-## RULES
-1. Plan ALL steps using pre-fetched context BEFORE any write call.
-2. Check pre-fetched data before creating anything — avoid duplicates.
-3. organizationNumber is always a STRING.
-4. If unsure of fields, GET with ?fields=* first (free). Every write must succeed first time.
-5. Bank account numbers: strip ALL separators → exactly 11 digits. "1234.56.78901" → "12345678901".
-6. 403 on the very first call → token invalid, stop immediately.
-7. Unknown task type + first 2 GETs return 404/403/500 → stop, report what you tried.
-8. Say DONE with a summary when finished.
-9. NEVER PUT/update an existing entity (customer, supplier, employee, etc.) unless the task explicitly asks you to change that entity's data. Use it as-is from pre-fetched context.
+## IDs And Updates
+- Use Tripletex resource IDs, not human numbers, unless the API explicitly wants a number field.
+- Important: account.id means the ledger account RESOURCE ID from pre-fetched ledger_accounts, not the account number like 1920 or 6340.
+- For PUT updates to existing entities: GET first, then PUT with id, version, and the required fields plus your changes.
 
-## API
-- Single entity: response.data.value | Lists: response.data.values | POST returns: response.data.value.id
-- All dates: YYYY-MM-DD | Discover fields: GET <endpoint>?fields=*
-- For tool calls: POST/PUT to normal endpoints MUST send the JSON payload in body. Query parameters belong in params.
+## Verified Query Defaults
+- GET /invoice requires invoiceDateFrom and invoiceDateTo. If unknown, use {DEFAULT_DATE_FROM} to {DEFAULT_DATE_TO}.
+- GET /order requires orderDateFrom and orderDateTo. If unknown, use {DEFAULT_DATE_FROM} to {DEFAULT_DATE_TO}.
+- GET /ledger/voucher requires dateFrom and dateTo. If unknown, use {DEFAULT_DATE_FROM} to {DEFAULT_DATE_TO}.
 
-## PUT — UNIVERSAL RULE
-ANY PUT to an existing entity:
-  1. GET it first → get current version + ALL field values
-  2. PUT with ALL fields + version + your changes
-  3. Missing version or required field → 422 "Kan ikke være null"
-Applies to: /employee, /project, /customer, /supplier, /ledger/account, etc.
-Exception: action endpoints (/:invoice, /:payment, /:depreciate, /:reverse, /:send) — NO body unless stated.
-Version conflict (409): re-fetch to get latest version, then retry.
+## Verified Action Endpoints
+- PUT /order/{{id}}/:invoice requires params.invoiceDate and no body.
+- PUT /invoice/{{id}}/:payment requires params.paymentDate, params.paymentTypeId, params.paidAmount, and usually params.paidAmountCurrency. No body.
+- PUT /invoice/{{id}}/:send requires params.sendType and no body.
+- PUT /invoice/{{id}}/:createCreditNote requires params.date and no body.
+- PUT /ledger/voucher/{{id}}/:reverse requires params.date and no body.
 
-## LEDGER ACCOUNTS
-Pre-fetched context has ALL accounts. Search it before calling GET /ledger/account.
-- isInactive:true → reactivate: PUT /ledger/account/{{id}} with {{id, version:0, isInactive:false, number, name, type}}
-- Missing entirely → create: POST /ledger/account {{number (INTEGER), name, type, vatType:{{id:0}}}}
-Valid types: ASSETS, EQUITY_AND_DEBT, OPERATING_REVENUES, OPERATING_EXPENSES, FINANCIAL_INCOME_AND_EXPENSES, TAX_ON_ORDINARY_ACTIVITY
-
-## ENDPOINTS
-
+## Common Workflows
 ### Employee
-POST /employee: firstName, lastName, email, userType:"STANDARD", department:{{id}}
-  Optional: dateOfBirth, nationalIdentityNumber, bankAccountNumber (11 digits), phoneNumberMobile
+- POST /employee with firstName, lastName, email, userType:"STANDARD", department:{{id}}.
+- POST /employee/employment with employee:{{id}}, startDate, isMainEmployer:true, taxDeductionCode:"loennFraHovedarbeidsgiver".
+- POST /employee/employment/details with employment:{{id}}, date, percentageOfFullTimeEquivalent, annualSalary or hourlyWage, and occupationCode:{{id}}.
+- occupationCode must be an object with a numeric id from GET /employee/employment/occupationCode.
 
-POST /employee/employment: employee:{{id}}, startDate, isMainEmployer:true, taxDeductionCode:"loennFraHovedarbeidsgiver"
-  Do NOT include salary or % here.
-
-POST /employee/employment/details: employment:{{id}}, date (=startDate)
-  Fields: percentageOfFullTimeEquivalent, annualSalary OR hourlyWage, occupationCode:{{id}}
-  Use percentageOfFullTimeEquivalent (NOT employmentPercentage), annualSalary (NOT annualWage).
-  monthlyWage and jobTitle do NOT exist in the API — will 422 if sent.
-  hourlyWage (number) is the correct field for hourly workers.
-  occupationCode MUST be an object {{id:N}} — look up via GET /employee/employment/occupationCode?name=<code> to find the numeric id.
-  occupationCode as a plain string or as {{id: "string"}} will 422 — always use {{id: <integer>}}.
-
-### Customer / Supplier
-POST /customer — name, isCustomer:true, organizationNumber (STRING)
-POST /supplier — name, isSupplier:true, organizationNumber (STRING). bankAccountNumber is NOT valid on supplier.
+### Customer And Supplier
+- POST /customer with name, isCustomer:true, organizationNumber.
+- POST /supplier with name, isSupplier:true, organizationNumber.
 
 ### Product
-POST /product — name, priceExcludingVatCurrency or priceIncludingVatCurrency; optional: number (STRING), vatType:{{id}}
-Check pre-fetched products — if name exists, use it.
+- POST /product with name and either priceExcludingVatCurrency or priceIncludingVatCurrency.
 
-### Invoice
-GET /invoice ALWAYS requires invoiceDateFrom AND invoiceDateTo — use 2020-01-01 to 2030-12-31 if unknown.
-GET /order ALWAYS requires orderDateFrom AND orderDateTo — use 2020-01-01 to 2030-12-31 if unknown.
-GET /ledger/voucher ALWAYS requires dateFrom AND dateTo — use 2020-01-01 to 2030-12-31 if unknown.
-1. Find/create customer, find/create product
-2. POST /order — customer, orderDate, deliveryDate, isPrioritizeAmountsIncludingVat,
-   orderLines:[{{product:{{id}}, count, unitPriceExcludingVatCurrency|unitPriceIncludingVatCurrency}}]
-   CRITICAL: ALL order lines MUST be included in the initial POST /order body.
-   There is NO endpoint to add/modify order lines after creation (/order/orderLine does NOT exist).
-3. PUT /order/{{id}}/:invoice?invoiceDate={today} — invoiceDate is ALWAYS REQUIRED. NO body.
-   If fails with "bank account" error → stop, do NOT retry (sandbox limitation).
-4. If "send": PUT /invoice/{{id}}/:send?sendType=EMAIL — NO body
+### Invoice And Payment
+- To invoice from an order, create/find prerequisites, POST /order with all orderLines included in the initial body, then PUT /order/{{id}}/:invoice with params.invoiceDate={today}.
+- VAT-exclusive prices use isPrioritizeAmountsIncludingVat:false with unitPriceExcludingVatCurrency.
+- VAT-inclusive prices use isPrioritizeAmountsIncludingVat:true with unitPriceIncludingVatCurrency.
 
-### Payment
-PUT /invoice/{{id}}/:payment — ALL fields as QUERY PARAMS (NOT body):
-  ?paymentDate=YYYY-MM-DD&paymentTypeId=N&paidAmount=N&paidAmountCurrency=N
-  Example: PUT /invoice/123/:payment?paymentDate=2026-03-21&paymentTypeId=28016109&paidAmount=33000&paidAmountCurrency=33000
-  In tool calls, prefer: endpoint="/invoice/123/:payment" and params={{...}} rather than embedding query args in endpoint.
+### Project And Timesheet
+- POST /project with name, projectManager:{{id}}, startDate, customer:{{id}}, isInternal:false.
+- Activities can be listed with GET /activity. POST /timesheet/entry needs employee, activity, project, date, hours.
 
-### Credit Note
-PUT /invoice/{{id}}/:createCreditNote?date=YYYY-MM-DD — date is REQUIRED query param, NO body
-
-### Project
-POST /project — name, projectManager:{{id}} (logged-in employee), startDate, customer:{{id}}, isInternal:false
-  Optional: budget, fixedprice (decimal), isFixedPrice:true/false
-Update: GET /project/{{id}} first → PUT with ALL fields + version + changes.
-  Example: {{id, version, name, startDate, customer:{{id}}, projectManager:{{id}}, isInternal, isFixedPrice:true, fixedprice:429500}}
-
-### Activity + Timesheets
-Activities are GLOBAL. GET /activity?fields=id,name,isProjectActivity to list them.
-Activity id:0 ("Generell") works for most cases — reuse it to avoid extra writes.
-POST /activity — name, activityType:"PROJECT_GENERAL_ACTIVITY"
-  isProjectActivity is readOnly — do NOT send it. activityType determines it.
-POST /timesheet/entry — employee:{{id}}, activity:{{id}}, project:{{id}}, date, hours (decimal)
-
-### Department
-POST /department — name, departmentNumber (unique int)
-
-### Voucher (manual journal / supplier invoice)
-POST /ledger/voucher — required: date (YYYY-MM-DD), description, postings:[...]
-Each posting: {{"row":1, "date":"YYYY-MM-DD", "account":{{"id":X}}, "amountGross":N, "amountGrossCurrency":N}}
-RULES:
-- amountGross MUST equal amountGrossCurrency
-- Postings MUST sum to zero. Positive=debit, Negative=credit.
-- NEVER include vatType in postings ("system-generated row" error)
-- NEVER post to 2400 (Leverandørgjeld) or 2600 (Skattetrekk) — system-managed
-
-Supplier invoice example (net 39800, 25% VAT=9950, total 49750):
-  {{"row":1,"date":"...","account":{{"id":<6340>}},"amountGross":39800,"amountGrossCurrency":39800}}
-  {{"row":2,"date":"...","account":{{"id":<2710>}},"amountGross":9950,"amountGrossCurrency":9950}}
-  {{"row":3,"date":"...","account":{{"id":<1920>}},"amountGross":-49750,"amountGrossCurrency":-49750}}
-
-Bank reconciliation: customer payments → PUT /invoice/:payment. Supplier without invoice → expense vs 1920.
-For bank reconciliation tasks with CSV/bank statement attachments:
-- Read the attachment carefully before any write call.
-- Match incoming customer payments to open invoices first.
-- For supplier payments without an invoice in Tripletex, create a balanced voucher.
-- If you need GET /ledger/voucher and do not know the date range yet, use dateFrom=2020-01-01 and dateTo=2030-12-31.
-Skattetrekk entries: credit 2600, debit 1920.
-Reverse a voucher: PUT /ledger/voucher/{{id}}/:reverse?date=YYYY-MM-DD — date is REQUIRED query param, NO body
-
-### Fixed Assets & Depreciation
-POST /asset:
-  name (required), dateOfAcquisition:"YYYY-MM-DD" (NOT acquisitionDate),
-  acquisitionCost:N, account:{{id:X}} (balance sheet, e.g. 1200),
-  depreciationAccount:{{id:X}} (expense account, e.g. 6010, NOT depreciationAccountNumber),
-  lifetime:N (months, NOT years), depreciationMethod:"STRAIGHT_LINE"|"TAX_RELATED"|"MANUAL"|"CUSTOMIZED_AMOUNT"|"NO_DEPRECIATION",
-  description (optional), incomingBalance:N (optional)
-PUT /asset/{{id}} — GET first for version + all fields, then PUT with all fields + version + changes.
-PUT /asset/{{id}}/:depreciate — body: {{date:"YYYY-MM-DD", amount:N}}
-If GET /asset → 403: fall back to manual vouchers (debit 6010, credit 1209).
-
-### Salary / Payroll
-GET /salary/type?fields=id,number,name → find salary type IDs (already in pre-fetched context).
-Key types: #2000 "Fastlønn" (fixed monthly salary), #2001 "Timelønn" (hourly wage), #5001 "Kilometergodtgjørelse bil"
-
-POST /salary/transaction — creates a salary run:
-{{
-  "date": "YYYY-MM-DD",
-  "year": 2026,
-  "month": 3,
-  "isHistorical": false,
-  "payslips": [{{
-    "employee": {{"id": 123}},
-    "date": "YYYY-MM-DD",
-    "year": 2026,
-    "month": 3,
-    "specifications": [{{
-      "salaryType": {{"id": <id of #2000>}},
-      "rate": 45000,
-      "count": 1,
-      "amount": 45000,
-      "employee": {{"id": 123}}
-    }}]
-  }}]
-}}
-Hourly wage: use #2001, rate=hourly_rate, count=hours_worked.
-The salary type IDs are in pre-fetched context under salary_types — use them directly.
-NOT WORKING: /salary/transaction (403), /salary/specification (403), /salary/payment (404), /salary/run (404)
-
-### Custom Accounting Dimensions (kostsenter / dimensjon)
-STOP IMMEDIATELY if task mentions: kostsenter, dimensjon, dimension, cost center, Kostenstelle, centre de coûts.
-These endpoints do NOT exist in the Tripletex API. After 2 GET attempts returning 404/403, report what you tried and say DONE.
+### Voucher, Supplier Invoice, Bank Reconciliation
+- POST /ledger/voucher with date, description, and balanced postings.
+- Each posting needs row, date, account:{{id}}, amountGross, amountGrossCurrency.
+- Postings can also include dimensions such as department:{{id}}, supplier:{{id}}, customer:{{id}}, project:{{id}} when the task requires them.
+- If the task says the expense belongs to a department, include the correct department id on the relevant voucher posting(s).
+- Postings must sum to zero. Positive is debit, negative is credit.
+- Use ledger account RESOURCE IDs from pre-fetched ledger_accounts.
+- Supplier invoice / expense voucher pattern: expense + VAT + bank/cash, balanced in one voucher.
+- Bank reconciliation pattern: customer receipts should usually be matched with PUT /invoice/:payment. Supplier or other outgoing bank items without a Tripletex invoice usually become vouchers.
+- Read CSV/text attachments carefully before creating vouchers.
 
 ### Travel Expense
-POST /travelExpense — employee:{{id}}, title, travelDetails:{{"isForeignTravel":false}}
-POST /travelExpense/perDiemCompensation — travelExpense:{{id}}, location:"Oslo"
-  DO NOT send: countryCode, numberOfDays, rateType, rateCategory (don't exist)
-POST /travelExpense/cost — travelExpense:{{id}}, amountCurrencyIncVat, paymentType:{{id}}
-  DO NOT send: vatAmountCurrency, vatType, amountGross, title (these fields do not exist — will 422)
-  To label a cost, use PUT /travelExpense/cost/{{id}} with category:"description" after creation.
+- POST /travelExpense with employee, title, travelDetails.
+- POST /travelExpense/perDiemCompensation with travelExpense and location.
+- POST /travelExpense/cost with travelExpense, amountCurrencyIncVat, paymentType.
 
-## VAT
-excl. VAT / uten mva / ohne MwSt → isPrioritizeAmountsIncludingVat:false, unitPriceExcludingVatCurrency
-incl. VAT / inkl. mva / mit MwSt → isPrioritizeAmountsIncludingVat:true, unitPriceIncludingVatCurrency
+### Fixed Assets
+- POST /asset with name, dateOfAcquisition, acquisitionCost, account:{{id}}, depreciationAccount:{{id}}, lifetime, depreciationMethod.
+- PUT /asset/{{id}}/:depreciate uses a body with date and amount.
 
-## TRANSLATIONS
-faktura/Rechnung/facture = invoice | leverandørfaktura/Lieferantenrechnung = SUPPLIER INVOICE (voucher!)
-reiseregning = travel expense | avdeling/Abteilung = department | kreditnota/Gutschrift = credit note
-bilag/Beleg/pièce = voucher | avskrivning/Abschreibung = depreciation | fastpris/Festpreis = fixed price project
+## Stop Conditions
+- If a task appears unsupported or repeated GET attempts only return 404/403/500, stop and explain what you tried.
+- Finish with DONE and a short summary when the task is complete.
 """
 
 
@@ -585,7 +585,7 @@ def detect_task_type(prompt: str) -> str:
 def task_verdict(stats: dict) -> tuple:
     """Returns (verdict_label, efficiency_note)."""
     stop = stats["stop_reason"]
-    errors = stats["errors_4xx"]
+    errors = stats["write_errors"]
     writes = stats["write_calls"]
     if "timeout" in stop:
         return "TIMED OUT ⏱", "no efficiency bonus"
@@ -600,7 +600,7 @@ def task_verdict(stats: dict) -> tuple:
         return "COMPLETED ✅", f"minor efficiency loss ({writes} writes)"
     if errors == 0:
         return "COMPLETED ⚠️", f"efficiency loss — {writes} writes is excessive"
-    return "SLOPPY ❌", f"{errors} failed write(s) — efficiency bonus lost"
+    return "SLOPPY ❌", f"{errors} failed or blocked write(s) — efficiency bonus likely lost"
 
 
 def run_agent(prompt: str, files: list, base_url: str, token: str, ctx: dict, rid: str = "", task_type: str = ""):
@@ -623,69 +623,7 @@ def run_agent(prompt: str, files: list, base_url: str, token: str, ctx: dict, ri
             if text is not None:
                 parts.append(types.Part(text=f"File: {f.get('filename', '')}\n{text}"))
 
-    # Context summary
-    def fmt_list(items, fn):
-        return "\n".join(f"  {fn(i)}" for i in items) if items else "  (none)"
-
-    ctx_text = f"""## Task
-{prompt}
-
-## Session
-- Employee ID: {ctx.get('employee_id')} ({ctx.get('employee_name')})
-- Company: {ctx.get('company_id')} — {ctx.get('company_name')}
-- Bank account: {ctx.get('bank_account') or 'not set'}
-- Today: {today}
-
-### VAT Types
-{fmt_list(ctx.get('vat_types', []), lambda v: f"ID {v['id']}: #{v['number']} {v['name']} ({v['pct']}%)")}
-
-### Payment Types
-{fmt_list(ctx.get('payment_types', []), lambda p: f"ID {p['id']}: {p.get('description') or p.get('displayName')} currency={p.get('currencyCode')} inactive={p.get('isInactive')}")}
-
-### Customers
-{fmt_list(ctx.get('customers', []), lambda c: f"ID {c['id']}: {c.get('name')} (org: {c.get('organizationNumber')}, email: {c.get('email')})")}
-
-### Suppliers
-{fmt_list(ctx.get('suppliers', []), lambda s: f"ID {s['id']}: {s.get('name')} (org: {s.get('organizationNumber')}, email: {s.get('email')})")}
-
-### Employees
-{fmt_list(ctx.get('employees', []), lambda e: f"ID {e['id']}: {e.get('firstName')} {e.get('lastName')} ({e.get('email')})")}
-
-### Products
-{fmt_list(ctx.get('products', []), lambda p: f"ID {p['id']}: {p.get('name')} (price excl: {p.get('priceExcludingVatCurrency')})")}
-
-### Invoices
-{fmt_list(ctx.get('invoices', []), lambda i: f"ID {i['id']}: #{i.get('invoiceNumber')} amount={i.get('amount')} outstanding={i.get('amountOutstanding')}")}
-
-### Orders
-{fmt_list(ctx.get('orders', []), lambda o: f"ID {o['id']}: #{o.get('number')} customer={o.get('customer', {}).get('name') if isinstance(o.get('customer'), dict) else '?'}")}
-
-### Vouchers
-{fmt_list(ctx.get('vouchers', []), lambda v: f"ID {v['id']}: #{v.get('number')} {v.get('date')} {v.get('description')}")}
-
-### Currencies
-{fmt_list(ctx.get('currencies', []), lambda c: f"ID {c['id']}: {c.get('code')} {c.get('displayName')}")}
-
-### Departments
-{fmt_list(ctx.get('departments', []), lambda d: f"ID {d['id']}: {d.get('name')} (#{d.get('departmentNumber')})")}
-
-### Projects
-{fmt_list(ctx.get('projects', []), lambda p: f"ID {p['id']}: {p.get('name')}")}
-
-### Travel Expenses
-{fmt_list(ctx.get('travel_expenses', []), lambda t: f"ID {t['id']}: {t.get('title')} status={t.get('status')}")}
-
-### Assets
-{fmt_list(ctx.get('assets', []), lambda a: f"ID {a['id']}: {a.get('name')} (acq cost: {a.get('acquisitionCost')})")}
-
-### Salary Types
-{fmt_list(ctx.get('salary_types', []), lambda s: f"ID {s['id']}: #{s.get('number')} {s.get('name')}")}
-
-### All Ledger Accounts ({len(ctx.get('ledger_accounts', []))} total)
-{fmt_list(ctx.get('ledger_accounts', []), lambda a: f"ID {a['id']}: #{a.get('number')} {a.get('name')}")}
-
----
-Plan your steps, then execute efficiently."""
+    ctx_text = _build_context_text(prompt, ctx, today, task_type)
 
     parts.append(types.Part(text=ctx_text))
     contents = [types.Content(role="user", parts=parts)]
@@ -696,7 +634,8 @@ Plan your steps, then execute efficiently."""
     stats = {
         "iterations": 0,
         "write_calls": 0,   # POST/PUT/DELETE — these cost efficiency score
-        "errors_4xx": 0,    # Client errors — also hurt score
+        "write_errors": 0,  # Failed or blocked writes
+        "read_errors": 0,   # Read-side 4xx/5xx for debugging only
         "calls": [],        # (method, endpoint, status, error_msg)
         "stop_reason": "max_iterations",
     }
@@ -798,7 +737,7 @@ Plan your steps, then execute efficiently."""
                             "example": feedback.get("example"),
                         },
                     }
-                    stats["errors_4xx"] += 1
+                    stats["write_errors"] += 1
                     stats["calls"].append({
                         "method": method,
                         "endpoint": endpoint,
@@ -847,7 +786,10 @@ Plan your steps, then execute efficiently."""
             # Parse error details fully for human readability
             error_summary = None
             if status >= 400:
-                stats["errors_4xx"] += 1
+                if is_write:
+                    stats["write_errors"] += 1
+                else:
+                    stats["read_errors"] += 1
                 d = result.get("data", {})
                 error_parts = []
                 if isinstance(d, dict):
@@ -978,7 +920,7 @@ Plan your steps, then execute efficiently."""
     print(f"{tag}{thin}")
     print(f"{tag}  VERDICT   : {verdict_label}")
     print(f"{tag}  Efficiency: {efficiency_note}")
-    print(f"{tag}  Writes    : {stats['write_calls']} total  ✅ {len(ok_writes)} ok  ❌ {len(failed_writes)} failed  |  4xx errors: {stats['errors_4xx']}")
+    print(f"{tag}  Writes    : {stats['write_calls']} total  ✅ {len(ok_writes)} ok  ❌ {len(failed_writes)} failed/blocked  |  write errors: {stats['write_errors']}  read errors: {stats['read_errors']}")
 
     if all_writes:
         print(f"{tag}{thin}")
@@ -1022,7 +964,7 @@ async def solve(request: Request):
         print(f"[{rid}]    \"{short_prompt}\"")
         print(f"[{rid}]    Files: {len(files)}")
 
-        ctx = await asyncio.to_thread(prefetch, base_url, token)
+        ctx = await asyncio.to_thread(prefetch, base_url, token, task_type)
         print(f"[{rid}] ── Context: {ctx.get('employee_name')} | {ctx.get('company_name')} | "
               f"customers={len(ctx.get('customers',[]))} employees={len(ctx.get('employees',[]))} "
               f"accounts={len(ctx.get('ledger_accounts',[]))}")
