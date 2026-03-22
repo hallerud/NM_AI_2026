@@ -510,7 +510,7 @@ def task_verdict(stats: dict) -> tuple:
 
 
 def run_agent(prompt: str, files: list, base_url: str, token: str, ctx: dict, rid: str = "", task_type: str = ""):
-    api_key = os.environ.get("GOOGLE_API_KEY")
+    api_key = "AIzaSyBI2N7eEJcn9-TUaizlJJMOuJtQIInOJHs"
     if not api_key:
         raise RuntimeError("GOOGLE_API_KEY is not set")
     client = genai.Client(api_key=api_key)
