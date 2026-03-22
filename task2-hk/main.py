@@ -6,6 +6,7 @@ import time
 import traceback
 import uuid
 from datetime import date
+from urllib.parse import parse_qsl
 
 import requests
 from fastapi import FastAPI, Request
@@ -69,14 +70,22 @@ def _find_nullish_paths(value, prefix=""):
                 paths.extend(_find_nullish_paths(item, path))
     return paths
 
+
+def _split_endpoint_and_query(endpoint: str) -> tuple[str, dict]:
+    path, sep, query = endpoint.partition("?")
+    if not sep or not query:
+        return endpoint, {}
+    return path, dict(parse_qsl(query, keep_blank_values=True))
+
 def tx(method: str, base_url: str, token: str, endpoint: str,
        params: dict = None, body: dict = None, bank_account: str = None) -> dict:
     m = method.upper()
-    ep = endpoint.split("?")[0]
+    endpoint_path, endpoint_query = _split_endpoint_and_query(endpoint)
+    ep = endpoint_path
     is_action = ep.split("/")[-1].startswith(":")
 
     # ── Local pre-flight checks — return early without hitting the API ──────────
-    params = _prune_nullish(params or {})
+    params = _prune_nullish({**endpoint_query, **(params or {})})
     body = _prune_nullish(body)
 
     def _missing_date(param_name: str) -> bool:
@@ -158,7 +167,7 @@ def tx(method: str, base_url: str, token: str, endpoint: str,
         try:
             r = requests.request(
                 method=m,
-                url=f"{base_url}{endpoint}",
+                url=f"{base_url}{endpoint_path}",
                 auth=("0", token),
                 params=params,
                 json=body if m in ("POST", "PUT") else None,
@@ -248,6 +257,8 @@ TOOLS = [types.Tool(function_declarations=[
         description=(
             "Make a request to the Tripletex v2 REST API. "
             "endpoint must start with / (e.g. /employee, /invoice). "
+            "Prefer passing query parameters in params instead of appending them to endpoint, "
+            "but if query params are already present in endpoint they will still be used. "
             "Action endpoints use colon syntax: PUT /order/{id}/:invoice, "
             "PUT /invoice/{id}/:send, PUT /invoice/{id}/:payment, "
             "PUT /invoice/{id}/:createCreditNote, PUT /asset/{id}/:depreciate."
@@ -354,6 +365,7 @@ GET /ledger/voucher ALWAYS requires dateFrom AND dateTo — use 2020-01-01 to 20
 PUT /invoice/{{id}}/:payment — ALL fields as QUERY PARAMS (NOT body):
   ?paymentDate=YYYY-MM-DD&paymentTypeId=N&paidAmount=N&paidAmountCurrency=N
   Example: PUT /invoice/123/:payment?paymentDate=2026-03-21&paymentTypeId=28016109&paidAmount=33000&paidAmountCurrency=33000
+  In tool calls, prefer: endpoint="/invoice/123/:payment" and params={{...}} rather than embedding query args in endpoint.
 
 ### Credit Note
 PUT /invoice/{{id}}/:createCreditNote?date=YYYY-MM-DD — date is REQUIRED query param, NO body
@@ -664,7 +676,8 @@ Plan your steps, then execute efficiently."""
             inp = _to_dict(fc.args) or {}
             method   = inp.get("method", "GET")
             endpoint = inp.get("endpoint", "")
-            params   = _prune_nullish(_to_dict(inp.get("params")))
+            endpoint, endpoint_query = _split_endpoint_and_query(endpoint)
+            params   = _prune_nullish({**endpoint_query, **(_to_dict(inp.get("params")) or {})})
             body     = _prune_nullish(_to_dict(inp.get("body")))
 
             is_write = method.upper() in WRITE_METHODS
