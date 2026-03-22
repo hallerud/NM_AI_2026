@@ -102,6 +102,8 @@ def tx(method: str, base_url: str, token: str, endpoint: str,
 
 def prefetch(base_url: str, token: str) -> dict:
     auth = ("0", token)
+    default_date_span = {"dateFrom": "2020-01-01", "dateTo": "2030-12-31"}
+    default_order_date_span = {"orderDateFrom": "2020-01-01", "orderDateTo": "2030-12-31"}
 
     def get(path, params=None):
         try:
@@ -138,8 +140,8 @@ def prefetch(base_url: str, token: str) -> dict:
     ctx["customers"]       = vals("/customer",             {"fields": "id,name,organizationNumber,email", "count": 50})
     ctx["employees"]       = vals("/employee",             {"fields": "id,firstName,lastName,email", "count": 50})
     ctx["products"]        = vals("/product",              {"fields": "id,name,priceExcludingVatCurrency", "count": 50})
-    ctx["invoices"]        = vals("/invoice",              {"fields": "id,invoiceNumber,customer,amount,amountOutstanding", "count": 30})
-    ctx["orders"]          = vals("/order",                {"fields": "id,number,customer,orderDate", "count": 30})
+    ctx["invoices"]        = vals("/invoice",              {"fields": "id,invoiceNumber,customer,amount,amountOutstanding", "count": 30, **default_date_span})
+    ctx["orders"]          = vals("/order",                {"fields": "id,number,customer,orderDate", "count": 30, **default_order_date_span})
     ctx["departments"]     = vals("/department",           {"fields": "id,name,departmentNumber", "count": 50})
     ctx["projects"]        = vals("/project",              {"fields": "id,name,number,customer,projectManager", "count": 50})
     ctx["travel_expenses"] = vals("/travelExpense",        {"fields": "id,title,employee,status", "count": 30})
@@ -168,7 +170,7 @@ TOOLS = [types.Tool(function_declarations=[
         parameters=types.Schema(
             type=types.Type.OBJECT,
             properties={
-                "method":   types.Schema(type=types.Type.STRING, enum=["GET", "POST", "PUT", "DELETE"]),
+                "method":   types.Schema(type=types.Type.STRING, enum=["GET", "POST", "PUT", "DELETE", "PATCH"]),
                 "endpoint": types.Schema(type=types.Type.STRING),
                 "params":   types.Schema(type=types.Type.OBJECT),
                 "body":     types.Schema(type=types.Type.OBJECT),
@@ -183,7 +185,7 @@ TOOLS = [types.Tool(function_declarations=[
 
 def _build_system_prompt(today: str) -> str:
     return f"""You are an expert Tripletex (Norwegian ERP) accounting agent.
-Complete tasks using the Tripletex v2 REST API. Tasks may be in any of: NO, EN, DE, ES, PT, FR.
+Complete tasks using the Tripletex v2 REST API. Tasks may be in any of: NO, NN, EN, DE, ES, PT, FR.
 Today: {today}
 
 ## SCORING — READ THIS FIRST
@@ -380,16 +382,16 @@ def detect_task_type(prompt: str) -> str:
     checks = [
         (["reiseregning", "travel expense", "note de frais", "gastos de viaje", "reisekost"], "Travel Expense"),
         (["kreditnota", "credit note", "gutschrift", "nota de crédito", "note de crédit"],     "Credit Note"),
-        (["leverandørfaktura", "supplier invoice", "lieferantenrechnung", "factura de proveedor", "facture fournisseur"], "Supplier Invoice"),
+        (["leverandørfaktura", "leverandorfaktura", "supplier invoice", "lieferantenrechnung", "factura de proveedor", "facture fournisseur"], "Supplier Invoice"),
         (["avskrivning", "depreciation", "abschreibung", "amortissement", "depreciación"],     "Depreciation"),
         (["bankavst", "bank reconciliation", "bankabstimmung", "conciliación bancaria"],       "Bank Reconciliation"),
         (["faktura", "invoice", "rechnung", "factura", "facture"],                             "Invoice"),
-        (["ansatt", "employee", "empleado", "mitarbeiter", "employé", "ansette"],              "Employee"),
+        (["ansatt", "tilsett", "employee", "empleado", "mitarbeiter", "employé", "ansette"],   "Employee"),
         (["prosjekt", "project", "proyecto", "projet", "projekt"],                             "Project"),
         (["avdeling", "department", "abteilung", "département", "departamento"],               "Department"),
-        (["leverandør", "supplier", "lieferant", "fournisseur", "proveedor"],                  "Supplier"),
-        (["timesheet", "timeregistr", "timer ", "tidsregistr", "horas trabajadas"],            "Timesheet"),
-        (["lønn", "payroll", "salary", "lohn", "salaire", "nómina"],                          "Salary/Payroll"),
+        (["leverandør", "leverandor", "supplier", "lieferant", "fournisseur", "proveedor"],    "Supplier"),
+        (["timesheet", "timeregistr", "timer ", "tidsregistr", "timeliste", "horas trabajadas"], "Timesheet"),
+        (["lønn", "lonn", "payroll", "salary", "lohn", "salaire", "nómina"],                   "Salary/Payroll"),
         (["bilag", "voucher", "beleg", "pièce comptable"],                                     "Voucher"),
         (["produkt", "product", "producto", "produit"],                                        "Product"),
         (["kunde", "customer", "cliente", "client"],                                           "Customer"),
@@ -530,6 +532,12 @@ Plan your steps, then execute efficiently."""
                 config=types.GenerateContentConfig(
                     system_instruction=_build_system_prompt(today),
                     tools=TOOLS,
+                    tool_config=types.ToolConfig(
+                        function_calling_config=types.FunctionCallingConfig(
+                            mode="ANY",
+                            allowed_function_names=["tripletex_api"],
+                        )
+                    ),
                     max_output_tokens=8192,
                 ),
             )
