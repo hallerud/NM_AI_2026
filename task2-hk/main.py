@@ -727,7 +727,6 @@ Plan your steps, then execute efficiently."""
                     tool_config=types.ToolConfig(
                         function_calling_config=types.FunctionCallingConfig(
                             mode="AUTO",
-                            allowed_function_names=["tripletex_api"],
                         )
                     ),
                     max_output_tokens=8192,
