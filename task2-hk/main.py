@@ -30,6 +30,50 @@ PROJECT_TASKS = {"Project", "Timesheet"}
 SALARY_TASKS = {"Salary/Payroll"}
 ASSET_TASKS = {"Depreciation"}
 
+ACCOUNTING_CONTEXT_KEYWORDS = (
+    "hovedbok", "hauptbuch", "general ledger", "ledger",
+    "bokfør", "bokfort", "bookkeep", "buchung",
+    "kostnad", "cost", "costs", "expense", "expenses", "utgift", "kosten",
+    "bankavst", "bank reconciliation", "bankutskrift", "avstem",
+    "leverandørfaktura", "leverandorfaktura", "supplier invoice",
+    "bilag", "voucher", "avdeling", "department",
+)
+PROJECT_CONTEXT_KEYWORDS = ("prosjekt", "project", "proyecto", "projet", "projekt")
+PROJECT_ACTIVITY_ENDPOINT = "/project/projectActivity"
+
+
+def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
+    haystack = (text or "").lower()
+    return any(keyword in haystack for keyword in keywords)
+
+
+def _context_flags(prompt: str, task_type: str) -> dict[str, bool]:
+    include_all = task_type == "Unknown"
+    needs_accounting = include_all or task_type in ACCOUNTING_HEAVY_TASKS or _contains_any(prompt, ACCOUNTING_CONTEXT_KEYWORDS)
+    needs_invoice = include_all or task_type in INVOICE_TASKS
+    needs_supplier = include_all or task_type in SUPPLIER_TASKS
+    needs_travel = include_all or task_type in TRAVEL_TASKS
+    needs_project = include_all or task_type in PROJECT_TASKS or _contains_any(prompt, PROJECT_CONTEXT_KEYWORDS)
+    needs_salary = include_all or task_type in SALARY_TASKS
+    needs_asset = include_all or task_type in ASSET_TASKS
+    needs_product = include_all or task_type in {"Invoice", "Product"}
+    needs_payment_types = include_all or task_type in INVOICE_TASKS or task_type in TRAVEL_TASKS or needs_accounting
+    needs_currencies = needs_accounting or needs_invoice
+    return {
+        "include_all": include_all,
+        "accounting": needs_accounting,
+        "invoice": needs_invoice,
+        "supplier": needs_supplier,
+        "travel": needs_travel,
+        "project": needs_project,
+        "salary": needs_salary,
+        "asset": needs_asset,
+        "product": needs_product,
+        "payment_types": needs_payment_types,
+        "currencies": needs_currencies,
+        "activities": needs_project,
+    }
+
 
 # ── Tripletex API helper ──────────────────────────────────────────────────────
 
@@ -150,11 +194,32 @@ def _missing_body_feedback(endpoint: str) -> dict:
         "message": f"{ep} requires a JSON payload in the tool body. Do not put the payload in endpoint or params.",
     })
 
+
+def _local_validation_error(
+    message: str = "Validation failed",
+    developer_message: str | None = None,
+    field_messages: list[tuple[str, str]] | None = None,
+    example: dict | None = None,
+    status_code: int = 422,
+) -> dict:
+    data = {"message": message}
+    if developer_message:
+        data["developerMessage"] = developer_message
+    if field_messages:
+        data["validationMessages"] = [
+            {"field": field, "message": field_message} if field else {"message": field_message}
+            for field, field_message in field_messages
+        ]
+    if example is not None:
+        data["example"] = example
+    return {"status_code": status_code, "data": data}
+
 def tx(method: str, base_url: str, token: str, endpoint: str,
        params: dict = None, body: dict = None, bank_account: str = None) -> dict:
     m = method.upper()
     endpoint_path, endpoint_query = _split_endpoint_and_query(endpoint)
     ep = endpoint_path
+    normalized_ep = ep.rstrip("/")
     is_action = ep.split("/")[-1].startswith(":")
 
     # ── Local pre-flight checks — return early without hitting the API ──────────
@@ -166,75 +231,120 @@ def tx(method: str, base_url: str, token: str, endpoint: str,
         v = params.get(param_name)
         return _is_nullish(v)
 
+    # 0. Common endpoint-shape mistakes that the model tends to loop on
+    if m == "PUT" and normalized_ep == "/project":
+        return _local_validation_error(
+            developer_message="Tripletex updates a single project via PUT /project/{id}. The /project root path does not support PUT.",
+            field_messages=[("endpoint", "Use /project/{id} instead of /project.")],
+            example={"method": "PUT", "endpoint": "/project/123", "body": {"name": "Updated project name"}},
+        )
+
+    invalid_project_activity_path = (
+        normalized_ep in {"/projectActivity", "/project/activity"}
+        or (
+            normalized_ep.startswith("/project/")
+            and normalized_ep.endswith("/projectActivity")
+            and not normalized_ep.startswith(PROJECT_ACTIVITY_ENDPOINT)
+        )
+    )
+    if invalid_project_activity_path:
+        return _local_validation_error(
+            developer_message=(
+                f"Project activities live under {PROJECT_ACTIVITY_ENDPOINT} or "
+                f"{PROJECT_ACTIVITY_ENDPOINT}/{{id}}. Do not use /projectActivity or /project/{{id}}/projectActivity."
+            ),
+            field_messages=[("endpoint", f"Use {PROJECT_ACTIVITY_ENDPOINT} instead.")],
+            example={"method": "POST", "endpoint": PROJECT_ACTIVITY_ENDPOINT, "body": {"project": {"id": 123}, "activity": {"id": 456}}},
+        )
+
+    if m == "POST" and normalized_ep == "/activity" and isinstance(body, dict):
+        if "project" in body or body.get("activityType") == "PROJECT_SPECIFIC_ACTIVITY":
+            return _local_validation_error(
+                developer_message=(
+                    f"PROJECT_SPECIFIC_ACTIVITY must be created via POST {PROJECT_ACTIVITY_ENDPOINT}. "
+                    "Do not include a project field in POST /activity."
+                ),
+                field_messages=[("endpoint", f"Use POST {PROJECT_ACTIVITY_ENDPOINT} for project-specific activities.")],
+                example={
+                    "method": "POST",
+                    "endpoint": PROJECT_ACTIVITY_ENDPOINT,
+                    "body": {
+                        "project": {"id": 123},
+                        "activity": {"name": "Custom Activity", "activityType": "PROJECT_SPECIFIC_ACTIVITY"},
+                    },
+                },
+            )
+        if _is_nullish(body.get("activityType")) and any(key in body for key in ("isProjectActivity", "isGeneral", "isTask")):
+            return _local_validation_error(
+                developer_message=(
+                    "POST /activity requires activityType. isProjectActivity, isGeneral, and isTask are derived/read-only flags; "
+                    "set activityType instead."
+                ),
+                field_messages=[("activityType", "Kan ikke være null. Set activityType instead of derived flags.")],
+                example={"method": "POST", "endpoint": "/activity", "body": {"name": "General project activity", "activityType": "PROJECT_GENERAL_ACTIVITY"}},
+            )
+
     # 1. POST/PUT to a non-action endpoint without a body
     if m in ("POST", "PUT") and not is_action and not body:
-        return {"status_code": 422, "data": {
-            "message": "Validation failed",
-            "validationMessages": [{"field": "request body", "message": "Kan ikke være null."}],
-        }}
+        return _local_validation_error(
+            field_messages=[("request body", "Kan ikke være null.")],
+        )
 
     # 2. PUT /:invoice — needs bank account AND invoiceDate query param
     if m == "PUT" and is_action and ep.endswith(":invoice"):
         if not bank_account:
-            return {"status_code": 422, "data": {
-                "message": "Validering feilet.",
-                "validationMessages": [{"message": "Faktura kan ikke opprettes før selskapet har registrert et bankkontonummer."}],
-            }}
+            return _local_validation_error(
+                message="Validering feilet.",
+                field_messages=[("", "Faktura kan ikke opprettes før selskapet har registrert et bankkontonummer.")],
+            )
         if _missing_date("invoiceDate"):
-            return {"status_code": 422, "data": {
-                "message": "Validation failed",
-                "validationMessages": [{"field": "invoiceDate", "message": "Kan ikke være null."}],
-            }}
+            return _local_validation_error(
+                field_messages=[("invoiceDate", "Kan ikke være null.")],
+            )
 
     # 3. PUT /:createCreditNote — requires ?date= query param
     if m == "PUT" and is_action and ep.endswith(":createCreditNote"):
         if _missing_date("date"):
-            return {"status_code": 422, "data": {
-                "message": "Validation failed",
-                "validationMessages": [{"field": "date", "message": "Kan ikke være null. Add ?date=YYYY-MM-DD as a query param."}],
-            }}
+            return _local_validation_error(
+                field_messages=[("date", "Kan ikke være null. Add ?date=YYYY-MM-DD as a query param.")],
+            )
 
     # 4. GET /ledger/voucher — requires dateFrom and dateTo
     if m == "GET" and ep.rstrip("/").endswith("/ledger/voucher"):
         missing = [f for f in ("dateFrom", "dateTo") if _missing_date(f)]
         if missing:
-            return {"status_code": 422, "data": {
-                "message": "Validation failed",
-                "validationMessages": [{"field": f, "message": "Kan ikke være null."} for f in missing],
-            }}
+            return _local_validation_error(
+                field_messages=[(f, "Kan ikke være null.") for f in missing],
+            )
 
     # 5. GET /invoice — requires invoiceDateFrom and invoiceDateTo
     if m == "GET" and ep.rstrip("/").endswith("/invoice"):
         missing = [f for f in ("invoiceDateFrom", "invoiceDateTo") if _missing_date(f)]
         if missing:
-            return {"status_code": 422, "data": {
-                "message": "Validation failed",
-                "validationMessages": [{"field": f, "message": "Kan ikke være null."} for f in missing],
-            }}
+            return _local_validation_error(
+                field_messages=[(f, "Kan ikke være null.") for f in missing],
+            )
 
     # 6. GET /order — requires orderDateFrom and orderDateTo
     if m == "GET" and ep.rstrip("/").endswith("/order"):
         missing = [f for f in ("orderDateFrom", "orderDateTo") if _missing_date(f)]
         if missing:
-            return {"status_code": 422, "data": {
-                "message": "Validation failed",
-                "validationMessages": [{"field": f, "message": "Kan ikke være null."} for f in missing],
-            }}
+            return _local_validation_error(
+                field_messages=[(f, "Kan ikke være null.") for f in missing],
+            )
 
     # 7. Bodyless action endpoints still require certain query params
     if m == "PUT" and is_action and ep.endswith(":payment"):
         missing = [f for f in ("paymentDate", "paymentTypeId", "paidAmount") if _is_nullish(params.get(f))]
         if missing:
-            return {"status_code": 422, "data": {
-                "message": "Validation failed",
-                "validationMessages": [{"field": f, "message": "Kan ikke være null."} for f in missing],
-            }}
+            return _local_validation_error(
+                field_messages=[(f, "Kan ikke være null.") for f in missing],
+            )
 
     if m == "PUT" and is_action and ep.endswith(":send") and _is_nullish(params.get("sendType")):
-        return {"status_code": 422, "data": {
-            "message": "Validation failed",
-            "validationMessages": [{"field": "sendType", "message": "Kan ikke være null."}],
-        }}
+        return _local_validation_error(
+            field_messages=[("sendType", "Kan ikke være null.")],
+        )
 
     # ── HTTP request with 429 retry ───────────────────────────────────────────
     for attempt in range(3):
@@ -268,9 +378,9 @@ def tx(method: str, base_url: str, token: str, endpoint: str,
 
 # ── Pre-fetch context ─────────────────────────────────────────────────────────
 
-def prefetch(base_url: str, token: str, task_type: str = "Unknown") -> dict:
+def prefetch(base_url: str, token: str, task_type: str = "Unknown", prompt: str = "") -> dict:
     auth = ("0", token)
-    include_all = task_type == "Unknown"
+    flags = _context_flags(prompt, task_type)
 
     def get(path, params=None):
         try:
@@ -306,18 +416,19 @@ def prefetch(base_url: str, token: str, task_type: str = "Unknown") -> dict:
     ctx["customers"]       = vals("/customer",             {"fields": "id,name,organizationNumber,email", "count": 50})
     ctx["employees"]       = vals("/employee",             {"fields": "id,firstName,lastName,email", "count": 50})
     ctx["departments"]     = vals("/department",           {"fields": "id,name,departmentNumber", "count": 50})
-    ctx["payment_types"]   = vals("/invoice/paymentType",  {"fields": "id,description,displayName,currencyCode,isInactive"}) if include_all or task_type in INVOICE_TASKS or task_type in TRAVEL_TASKS or task_type in ACCOUNTING_HEAVY_TASKS else []
-    ctx["suppliers"]       = vals("/supplier",             {"fields": "id,name,organizationNumber,email", "count": 50}) if include_all or task_type in SUPPLIER_TASKS else []
-    ctx["products"]        = vals("/product",              {"fields": "id,name,priceExcludingVatCurrency", "count": 50}) if include_all or task_type in {"Invoice", "Product"} else []
-    ctx["invoices"]        = vals("/invoice",              {"fields": "id,invoiceNumber,customer,amount,amountOutstanding", "count": 30, **DEFAULT_INVOICE_QUERY}) if include_all or task_type in INVOICE_TASKS else []
-    ctx["orders"]          = vals("/order",                {"fields": "id,number,customer,orderDate", "count": 30, **DEFAULT_ORDER_QUERY}) if include_all or task_type in INVOICE_TASKS else []
-    ctx["vouchers"]        = vals("/ledger/voucher",       {"fields": "id,number,date,description", "count": 30, **DEFAULT_VOUCHER_QUERY}) if include_all or task_type in ACCOUNTING_HEAVY_TASKS else []
-    ctx["currencies"]      = vals("/currency",             {"fields": "id,code,displayName", "count": 50}) if include_all or task_type in ACCOUNTING_HEAVY_TASKS or task_type in INVOICE_TASKS else []
-    ctx["projects"]        = vals("/project",              {"fields": "id,name,number,customer,projectManager", "count": 50}) if include_all or task_type in PROJECT_TASKS else []
-    ctx["travel_expenses"] = vals("/travelExpense",        {"fields": "id,title,employee,status", "count": 30}) if include_all or task_type in TRAVEL_TASKS else []
-    ctx["assets"]          = vals("/asset",                {"fields": "id,name,accountNumber,acquisitionCost,depreciationRate", "count": 50}) if include_all or task_type in ASSET_TASKS else []
-    ctx["ledger_accounts"] = vals("/ledger/account", {"fields": "id,number,name,isInactive", "count": 1000}) if include_all or task_type in ACCOUNTING_HEAVY_TASKS else []
-    ctx["salary_types"]    = vals("/salary/type",    {"fields": "id,number,name", "count": 100}) if include_all or task_type in SALARY_TASKS else []
+    ctx["payment_types"]   = vals("/invoice/paymentType",  {"fields": "id,description,displayName,currencyCode,isInactive"}) if flags["payment_types"] else []
+    ctx["suppliers"]       = vals("/supplier",             {"fields": "id,name,organizationNumber,email", "count": 50}) if flags["supplier"] else []
+    ctx["products"]        = vals("/product",              {"fields": "id,name,priceExcludingVatCurrency", "count": 50}) if flags["product"] else []
+    ctx["invoices"]        = vals("/invoice",              {"fields": "id,invoiceNumber,customer,amount,amountOutstanding", "count": 30, **DEFAULT_INVOICE_QUERY}) if flags["invoice"] else []
+    ctx["orders"]          = vals("/order",                {"fields": "id,number,customer,orderDate", "count": 30, **DEFAULT_ORDER_QUERY}) if flags["invoice"] else []
+    ctx["vouchers"]        = vals("/ledger/voucher",       {"fields": "id,number,date,description", "count": 30, **DEFAULT_VOUCHER_QUERY}) if flags["accounting"] else []
+    ctx["currencies"]      = vals("/currency",             {"fields": "id,code,displayName", "count": 50}) if flags["currencies"] else []
+    ctx["projects"]        = vals("/project",              {"fields": "id,name,number,customer,projectManager", "count": 50}) if flags["project"] else []
+    ctx["activities"]      = vals("/activity",             {"fields": "id,name,activityType,displayName", "count": 100}) if flags["activities"] else []
+    ctx["travel_expenses"] = vals("/travelExpense",        {"fields": "id,title,employee,status", "count": 30}) if flags["travel"] else []
+    ctx["assets"]          = vals("/asset",                {"fields": "id,name,accountNumber,acquisitionCost,depreciationRate", "count": 50}) if flags["asset"] else []
+    ctx["ledger_accounts"] = vals("/ledger/account", {"fields": "id,number,name,isInactive", "count": 1000}) if flags["accounting"] else []
+    ctx["salary_types"]    = vals("/salary/type",    {"fields": "id,number,name", "count": 100}) if flags["salary"] else []
 
     return ctx
 
@@ -329,6 +440,7 @@ def _render_section(title: str, items: list, formatter) -> str:
 
 
 def _build_context_text(prompt: str, ctx: dict, today: str, task_type: str) -> str:
+    flags = _context_flags(prompt, task_type)
     sections = [
         "## Task",
         prompt,
@@ -348,19 +460,19 @@ def _build_context_text(prompt: str, ctx: dict, today: str, task_type: str) -> s
         _render_section("Departments", ctx.get("departments", []), lambda d: f"ID {d['id']}: {d.get('name')} (#{d.get('departmentNumber')})"),
     ]
 
-    if task_type == "Unknown" or task_type in INVOICE_TASKS or task_type in TRAVEL_TASKS or task_type in ACCOUNTING_HEAVY_TASKS:
+    if flags["payment_types"]:
         sections.extend([
             "",
             _render_section("Payment Types", ctx.get("payment_types", []), lambda p: f"ID {p['id']}: {p.get('description') or p.get('displayName')} currency={p.get('currencyCode')} inactive={p.get('isInactive')}"),
         ])
 
-    if task_type == "Unknown" or task_type in {"Invoice", "Product"}:
+    if flags["product"]:
         sections.extend([
             "",
             _render_section("Products", ctx.get("products", []), lambda p: f"ID {p['id']}: {p.get('name')} (price excl: {p.get('priceExcludingVatCurrency')})"),
         ])
 
-    if task_type == "Unknown" or task_type in INVOICE_TASKS:
+    if flags["invoice"]:
         sections.extend([
             "",
             _render_section("Invoices", ctx.get("invoices", []), lambda i: f"ID {i['id']}: #{i.get('invoiceNumber')} amount={i.get('amount')} outstanding={i.get('amountOutstanding')}"),
@@ -368,37 +480,39 @@ def _build_context_text(prompt: str, ctx: dict, today: str, task_type: str) -> s
             _render_section("Orders", ctx.get("orders", []), lambda o: f"ID {o['id']}: #{o.get('number')} customer={o.get('customer', {}).get('name') if isinstance(o.get('customer'), dict) else '?'}"),
         ])
 
-    if task_type == "Unknown" or task_type in SUPPLIER_TASKS:
+    if flags["supplier"]:
         sections.extend([
             "",
             _render_section("Suppliers", ctx.get("suppliers", []), lambda s: f"ID {s['id']}: {s.get('name')} (org: {s.get('organizationNumber')}, email: {s.get('email')})"),
         ])
 
-    if task_type == "Unknown" or task_type in PROJECT_TASKS:
+    if flags["project"]:
         sections.extend([
             "",
             _render_section("Projects", ctx.get("projects", []), lambda p: f"ID {p['id']}: {p.get('name')}"),
+            "",
+            _render_section("Activities", ctx.get("activities", []), lambda a: f"ID {a['id']}: {a.get('name')} type={a.get('activityType')}"),
         ])
 
-    if task_type == "Unknown" or task_type in TRAVEL_TASKS:
+    if flags["travel"]:
         sections.extend([
             "",
             _render_section("Travel Expenses", ctx.get("travel_expenses", []), lambda t: f"ID {t['id']}: {t.get('title')} status={t.get('status')}"),
         ])
 
-    if task_type == "Unknown" or task_type in ASSET_TASKS:
+    if flags["asset"]:
         sections.extend([
             "",
             _render_section("Assets", ctx.get("assets", []), lambda a: f"ID {a['id']}: {a.get('name')} (acq cost: {a.get('acquisitionCost')})"),
         ])
 
-    if task_type == "Unknown" or task_type in SALARY_TASKS:
+    if flags["salary"]:
         sections.extend([
             "",
             _render_section("Salary Types", ctx.get("salary_types", []), lambda s: f"ID {s['id']}: #{s.get('number')} {s.get('name')}"),
         ])
 
-    if task_type == "Unknown" or task_type in ACCOUNTING_HEAVY_TASKS:
+    if flags["accounting"]:
         sections.extend([
             "",
             _render_section("Vouchers", ctx.get("vouchers", []), lambda v: f"ID {v['id']}: #{v.get('number')} {v.get('date')} {v.get('description')}"),
@@ -407,7 +521,7 @@ def _build_context_text(prompt: str, ctx: dict, today: str, task_type: str) -> s
             "\n".join(f"  ID {a['id']}: #{a.get('number')} {a.get('name')}" for a in ctx.get("ledger_accounts", [])) or "  (none)",
         ])
 
-    if task_type == "Unknown" or task_type in ACCOUNTING_HEAVY_TASKS or task_type in INVOICE_TASKS:
+    if flags["currencies"]:
         sections.extend([
             "",
             _render_section("Currencies", ctx.get("currencies", []), lambda c: f"ID {c['id']}: {c.get('code')} {c.get('displayName')}"),
@@ -428,6 +542,9 @@ TOOLS = [types.Tool(function_declarations=[
             "Prefer passing query parameters in params instead of appending them to endpoint, "
             "but if query params are already present in endpoint they will still be used. "
             "Use Tripletex resource IDs in bodies; for voucher postings account.id must be the ledger account resource ID, not the account number. "
+            "For POST /activity, set activityType and do not send derived flags like isProjectActivity/isGeneral/isTask. "
+            f"Project-specific activities belong under {PROJECT_ACTIVITY_ENDPOINT}, not under /activity. "
+            "Update one project with PUT /project/{id}, not PUT /project. "
             "Action endpoints use colon syntax: PUT /order/{id}/:invoice, "
             "PUT /invoice/{id}/:send, PUT /invoice/{id}/:payment, "
             "PUT /invoice/{id}/:createCreditNote, PUT /asset/{id}/:depreciate."
@@ -481,11 +598,13 @@ GET calls are free. Use them to verify before writing.
 8. Bank account numbers must be 11 digits with separators removed.
 9. If you are unsure of resource fields, do a free GET with fields=* before the write call.
 10. If the first call returns 401 or an auth-related 403, stop and report the token problem.
+11. If the task asks you to analyze, compare, identify, explain, or report something, start by assuming it may be read-only. Only write when the task explicitly requires a create/update/delete/accounting action.
+12. Never invent placeholder/demo values like "Test Project", "Custom Activity", fake names, or guessed IDs. If the task does not specify a value, inspect existing data first or stop.
 
 ## IDs And Updates
 - Use Tripletex resource IDs, not human numbers, unless the API explicitly wants a number field.
 - Important: account.id means the ledger account RESOURCE ID from pre-fetched ledger_accounts, not the account number like 1920 or 6340.
-- For PUT updates to existing entities: GET first, then PUT with id, version, and the required fields plus your changes.
+- GET first when unsure, but follow the exact documented write endpoint. Some PUT endpoints accept partial update objects, so do not blindly resend every field or invent nested fields.
 
 ## Verified Query Defaults
 - GET /invoice requires invoiceDateFrom and invoiceDateTo. If unknown, use {DEFAULT_DATE_FROM} to {DEFAULT_DATE_TO}.
@@ -520,7 +639,13 @@ GET calls are free. Use them to verify before writing.
 
 ### Project And Timesheet
 - POST /project with name, projectManager:{{id}}, startDate, customer:{{id}}, isInternal:false.
-- Activities can be listed with GET /activity. POST /timesheet/entry needs employee, activity, project, date, hours.
+- Update a project with PUT /project/{{id}}. Do not use PUT /project.
+- Activities can be listed with GET /activity.
+- POST /activity is for global/general activities. Set activityType explicitly.
+- PROJECT_SPECIFIC_ACTIVITY must be created via POST {PROJECT_ACTIVITY_ENDPOINT}, not POST /activity.
+- POST {PROJECT_ACTIVITY_ENDPOINT} uses a body with project:{{id}} and activity. Use activity:{{id}} to attach an existing activity, or a nested activity object to create a new project-specific activity.
+- There is no root /projectActivity endpoint and no /project/{{id}}/projectActivity endpoint.
+- POST /timesheet/entry needs employee, activity, project, date, hours.
 
 ### Voucher, Supplier Invoice, Bank Reconciliation
 - POST /ledger/voucher with date, description, and balanced postings.
@@ -964,10 +1089,10 @@ async def solve(request: Request):
         print(f"[{rid}]    \"{short_prompt}\"")
         print(f"[{rid}]    Files: {len(files)}")
 
-        ctx = await asyncio.to_thread(prefetch, base_url, token, task_type)
+        ctx = await asyncio.to_thread(prefetch, base_url, token, task_type, prompt)
         print(f"[{rid}] ── Context: {ctx.get('employee_name')} | {ctx.get('company_name')} | "
               f"customers={len(ctx.get('customers',[]))} employees={len(ctx.get('employees',[]))} "
-              f"accounts={len(ctx.get('ledger_accounts',[]))}")
+              f"accounts={len(ctx.get('ledger_accounts',[]))} activities={len(ctx.get('activities',[]))}")
 
         await asyncio.to_thread(run_agent, prompt, files, base_url, token, ctx, rid, task_type)
 
