@@ -68,22 +68,34 @@ def tx(method: str, base_url: str, token: str, endpoint: str,
                 "validationMessages": [{"field": f, "message": "Kan ikke være null."} for f in missing],
             }}
 
-    try:
-        r = requests.request(
-            method=method.upper(),
-            url=f"{base_url}{endpoint}",
-            auth=("0", token),
-            params=params,
-            json=body if method.upper() in ("POST", "PUT", "PATCH") else None,
-            timeout=60,
-        )
+    # ── HTTP request with 429 retry ───────────────────────────────────────────
+    for attempt in range(3):
         try:
-            data = r.json()
-        except Exception:
-            data = r.text
-        return {"status_code": r.status_code, "data": data}
-    except Exception as e:
-        return {"status_code": 0, "error": str(e)}
+            r = requests.request(
+                method=m,
+                url=f"{base_url}{endpoint}",
+                auth=("0", token),
+                params=params,
+                json=body if m in ("POST", "PUT", "PATCH") else None,
+                timeout=60,
+            )
+            try:
+                data = r.json()
+            except Exception:
+                data = r.text
+
+            if r.status_code == 429 and attempt < 2:
+                wait = int(r.headers.get("Retry-After", 20))
+                print(f"  ⏳ 429 Too Many Requests — waiting {wait}s (attempt {attempt + 1}/3)…")
+                time.sleep(wait)
+                continue
+
+            return {"status_code": r.status_code, "data": data}
+
+        except Exception as e:
+            return {"status_code": 0, "error": str(e)}
+
+    return {"status_code": 429, "data": {"message": "Rate limit: all retries exhausted."}}
 
 
 # ── Pre-fetch context ─────────────────────────────────────────────────────────
@@ -498,6 +510,7 @@ Plan your steps, then execute efficiently."""
 
     WRITE_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
     consecutive_404s = 0
+    consecutive_write_errors = 0
     fatal_stop = False
 
     for i in range(15):
@@ -634,12 +647,24 @@ Plan your steps, then execute efficiently."""
             else:
                 consecutive_404s = 0
 
+            if is_write and status >= 400:
+                consecutive_write_errors += 1
+            elif is_write:
+                consecutive_write_errors = 0
+
             if status >= 400:
                 d = result.get("data", {})
                 err_text = ""
                 if isinstance(d, dict):
                     validation_msgs = " ".join(str(v.get("message", "")) for v in (d.get("validationMessages") or []) if isinstance(v, dict))
                     err_text = (str(d.get("message", "")) + " " + str(d.get("developerMessage", "")) + " " + validation_msgs).lower()
+
+                # Fatal: 401 Unauthorized — token missing or expired, nothing will work
+                if status == 401:
+                    stats["stop_reason"] = "fatal: 401 unauthorized"
+                    print(f"{tag}  🛑 Fatal: 401 Unauthorized — stopping.")
+                    fatal_stop = True
+                    break
 
                 # Fatal: sandbox has no bank account — no point retrying
                 if "bank account" in err_text or "bankkonto" in err_text:
@@ -661,6 +686,13 @@ Plan your steps, then execute efficiently."""
             if consecutive_404s >= 3:
                 stats["stop_reason"] = "fatal: repeated 404s — unknown endpoint"
                 print(f"{tag}  🛑 Fatal: 3 consecutive 404s — stopping (unknown endpoint).")
+                fatal_stop = True
+                break
+
+            # Fatal: 3+ consecutive write errors — agent is stuck in a retry loop
+            if consecutive_write_errors >= 3:
+                stats["stop_reason"] = "fatal: 3 consecutive write errors — stuck"
+                print(f"{tag}  🛑 Fatal: 3 consecutive failed writes — stopping to avoid penalty.")
                 fatal_stop = True
                 break
 
