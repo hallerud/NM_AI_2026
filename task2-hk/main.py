@@ -18,6 +18,57 @@ app = FastAPI()
 
 # ── Tripletex API helper ──────────────────────────────────────────────────────
 
+def _is_nullish(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip() in ("", "null", "None"):
+        return True
+    return False
+
+
+def _prune_nullish(value):
+    """Remove null-like values so optional fields are omitted instead of sent as null."""
+    if isinstance(value, dict):
+        cleaned = {}
+        for k, v in value.items():
+            if _is_nullish(v):
+                continue
+            pruned = _prune_nullish(v)
+            if pruned in ({}, []):
+                continue
+            cleaned[k] = pruned
+        return cleaned
+    if isinstance(value, list):
+        cleaned = []
+        for item in value:
+            if _is_nullish(item):
+                continue
+            pruned = _prune_nullish(item)
+            if pruned in ({}, []):
+                continue
+            cleaned.append(pruned)
+        return cleaned
+    return value
+
+
+def _find_nullish_paths(value, prefix=""):
+    paths = []
+    if isinstance(value, dict):
+        for k, v in value.items():
+            path = f"{prefix}.{k}" if prefix else str(k)
+            if _is_nullish(v):
+                paths.append(path)
+            else:
+                paths.extend(_find_nullish_paths(v, path))
+    elif isinstance(value, list):
+        for i, item in enumerate(value):
+            path = f"{prefix}[{i}]"
+            if _is_nullish(item):
+                paths.append(path)
+            else:
+                paths.extend(_find_nullish_paths(item, path))
+    return paths
+
 def tx(method: str, base_url: str, token: str, endpoint: str,
        params: dict = None, body: dict = None, bank_account: str = None) -> dict:
     m = method.upper()
@@ -25,14 +76,15 @@ def tx(method: str, base_url: str, token: str, endpoint: str,
     is_action = ep.split("/")[-1].startswith(":")
 
     # ── Local pre-flight checks — return early without hitting the API ──────────
-    params = params or {}
+    params = _prune_nullish(params or {})
+    body = _prune_nullish(body)
 
     def _missing_date(param_name: str) -> bool:
         v = params.get(param_name)
-        return not v or str(v).strip() in ("", "null", "None")
+        return _is_nullish(v)
 
-    # 1. POST/PUT/PATCH to a non-action endpoint without a body
-    if m in ("POST", "PUT", "PATCH") and not is_action and not body:
+    # 1. POST/PUT to a non-action endpoint without a body
+    if m in ("POST", "PUT") and not is_action and not body:
         return {"status_code": 422, "data": {
             "message": "Validation failed",
             "validationMessages": [{"field": "request body", "message": "Kan ikke være null."}],
@@ -68,6 +120,39 @@ def tx(method: str, base_url: str, token: str, endpoint: str,
                 "validationMessages": [{"field": f, "message": "Kan ikke være null."} for f in missing],
             }}
 
+    # 5. GET /invoice — requires invoiceDateFrom and invoiceDateTo
+    if m == "GET" and ep.rstrip("/").endswith("/invoice"):
+        missing = [f for f in ("invoiceDateFrom", "invoiceDateTo") if _missing_date(f)]
+        if missing:
+            return {"status_code": 422, "data": {
+                "message": "Validation failed",
+                "validationMessages": [{"field": f, "message": "Kan ikke være null."} for f in missing],
+            }}
+
+    # 6. GET /order — requires orderDateFrom and orderDateTo
+    if m == "GET" and ep.rstrip("/").endswith("/order"):
+        missing = [f for f in ("orderDateFrom", "orderDateTo") if _missing_date(f)]
+        if missing:
+            return {"status_code": 422, "data": {
+                "message": "Validation failed",
+                "validationMessages": [{"field": f, "message": "Kan ikke være null."} for f in missing],
+            }}
+
+    # 7. Bodyless action endpoints still require certain query params
+    if m == "PUT" and is_action and ep.endswith(":payment"):
+        missing = [f for f in ("paymentDate", "paymentTypeId", "paidAmount") if _is_nullish(params.get(f))]
+        if missing:
+            return {"status_code": 422, "data": {
+                "message": "Validation failed",
+                "validationMessages": [{"field": f, "message": "Kan ikke være null."} for f in missing],
+            }}
+
+    if m == "PUT" and is_action and ep.endswith(":send") and _is_nullish(params.get("sendType")):
+        return {"status_code": 422, "data": {
+            "message": "Validation failed",
+            "validationMessages": [{"field": "sendType", "message": "Kan ikke være null."}],
+        }}
+
     # ── HTTP request with 429 retry ───────────────────────────────────────────
     for attempt in range(3):
         try:
@@ -76,7 +161,7 @@ def tx(method: str, base_url: str, token: str, endpoint: str,
                 url=f"{base_url}{endpoint}",
                 auth=("0", token),
                 params=params,
-                json=body if m in ("POST", "PUT", "PATCH") else None,
+                json=body if m in ("POST", "PUT") else None,
                 timeout=60,
             )
             try:
@@ -102,7 +187,7 @@ def tx(method: str, base_url: str, token: str, endpoint: str,
 
 def prefetch(base_url: str, token: str) -> dict:
     auth = ("0", token)
-    default_date_span = {"dateFrom": "2020-01-01", "dateTo": "2030-12-31"}
+    default_invoice_date_span = {"invoiceDateFrom": "2020-01-01", "invoiceDateTo": "2030-12-31"}
     default_order_date_span = {"orderDateFrom": "2020-01-01", "orderDateTo": "2030-12-31"}
 
     def get(path, params=None):
@@ -140,7 +225,7 @@ def prefetch(base_url: str, token: str) -> dict:
     ctx["customers"]       = vals("/customer",             {"fields": "id,name,organizationNumber,email", "count": 50})
     ctx["employees"]       = vals("/employee",             {"fields": "id,firstName,lastName,email", "count": 50})
     ctx["products"]        = vals("/product",              {"fields": "id,name,priceExcludingVatCurrency", "count": 50})
-    ctx["invoices"]        = vals("/invoice",              {"fields": "id,invoiceNumber,customer,amount,amountOutstanding", "count": 30, **default_date_span})
+    ctx["invoices"]        = vals("/invoice",              {"fields": "id,invoiceNumber,customer,amount,amountOutstanding", "count": 30, **default_invoice_date_span})
     ctx["orders"]          = vals("/order",                {"fields": "id,number,customer,orderDate", "count": 30, **default_order_date_span})
     ctx["departments"]     = vals("/department",           {"fields": "id,name,departmentNumber", "count": 50})
     ctx["projects"]        = vals("/project",              {"fields": "id,name,number,customer,projectManager", "count": 50})
@@ -170,7 +255,7 @@ TOOLS = [types.Tool(function_declarations=[
         parameters=types.Schema(
             type=types.Type.OBJECT,
             properties={
-                "method":   types.Schema(type=types.Type.STRING, enum=["GET", "POST", "PUT", "DELETE", "PATCH"]),
+                "method":   types.Schema(type=types.Type.STRING, enum=["GET", "POST", "PUT", "DELETE"]),
                 "endpoint": types.Schema(type=types.Type.STRING),
                 "params":   types.Schema(type=types.Type.OBJECT),
                 "body":     types.Schema(type=types.Type.OBJECT),
@@ -191,10 +276,11 @@ Today: {today}
 ## SCORING — READ THIS FIRST
 Score = correctness × tier multiplier × efficiency bonus.
 Efficiency bonus (up to 2×) only applies on PERFECT correctness. Hurt by:
-  - Any extra write call (POST/PUT/DELETE/PATCH) — even successful ones
+  - Any extra write call (POST/PUT/DELETE) — even successful ones
   - Any 4xx error on a write call
 
 GET calls are FREE. Strategy: plan using pre-fetched data → minimum writes → zero retries.
+Never send null/None/"null"/empty-string values to the API. If a field is optional and you do not know it, omit it entirely.
 
 ## RULES
 1. Plan ALL steps using pre-fetched context BEFORE any write call.
@@ -252,7 +338,7 @@ POST /product — name, priceExcludingVatCurrency or priceIncludingVatCurrency; 
 Check pre-fetched products — if name exists, use it.
 
 ### Invoice
-GET /invoice ALWAYS requires dateFrom AND dateTo — use 2020-01-01 to 2030-12-31 if unknown.
+GET /invoice ALWAYS requires invoiceDateFrom AND invoiceDateTo — use 2020-01-01 to 2030-12-31 if unknown.
 GET /order ALWAYS requires orderDateFrom AND orderDateTo — use 2020-01-01 to 2030-12-31 if unknown.
 GET /ledger/voucher ALWAYS requires dateFrom AND dateTo — use 2020-01-01 to 2030-12-31 if unknown.
 1. Find/create customer, find/create product
@@ -424,8 +510,10 @@ def task_verdict(stats: dict) -> tuple:
 
 
 def run_agent(prompt: str, files: list, base_url: str, token: str, ctx: dict, rid: str = "", task_type: str = ""):
-    # client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
-    client = genai.Client(api_key="AIzaSyBI2N7eEJcn9-TUaizlJJMOuJtQIInOJHs")
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GOOGLE_API_KEY is not set")
+    client = genai.Client(api_key=api_key)
     start = time.time()
     today = date.today().isoformat()
 
@@ -505,13 +593,13 @@ Plan your steps, then execute efficiently."""
     # ── Per-task stats tracking ───────────────────────────────────────────────
     stats = {
         "iterations": 0,
-        "write_calls": 0,   # POST/PUT/DELETE/PATCH — these cost efficiency score
+        "write_calls": 0,   # POST/PUT/DELETE — these cost efficiency score
         "errors_4xx": 0,    # Client errors — also hurt score
         "calls": [],        # (method, endpoint, status, error_msg)
         "stop_reason": "max_iterations",
     }
 
-    WRITE_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
+    WRITE_METHODS = {"POST", "PUT", "DELETE"}
     consecutive_404s = 0
     consecutive_write_errors = 0
     fatal_stop = False
@@ -576,8 +664,8 @@ Plan your steps, then execute efficiently."""
             inp = _to_dict(fc.args) or {}
             method   = inp.get("method", "GET")
             endpoint = inp.get("endpoint", "")
-            params   = _to_dict(inp.get("params"))
-            body     = _to_dict(inp.get("body"))
+            params   = _prune_nullish(_to_dict(inp.get("params")))
+            body     = _prune_nullish(_to_dict(inp.get("body")))
 
             is_write = method.upper() in WRITE_METHODS
             call_icon = "✏️ " if is_write else "🔍"
@@ -586,8 +674,12 @@ Plan your steps, then execute efficiently."""
                 print(f"  body={json.dumps(body)[:200]}", end="")
             print()
 
-            # Guard: POST/PUT/PATCH without a body will cause 422 "Kan ikke være null"
-            if method.upper() in ("POST", "PUT", "PATCH") and not body:
+            null_paths = _find_nullish_paths(_to_dict(inp.get("params"))) + _find_nullish_paths(_to_dict(inp.get("body")))
+            if null_paths:
+                print(f"{tag}  ℹ️ Stripped nullish fields before request: {', '.join(null_paths[:8])}")
+
+            # Guard: POST/PUT without a body will cause 422 "Kan ikke være null"
+            if method.upper() in ("POST", "PUT") and not body:
                 # Exception: action endpoints like /:invoice, /:payment, /:send etc. are bodyless by design
                 is_action = endpoint.split("?")[0].split("/")[-1].startswith(":")
                 if not is_action:
